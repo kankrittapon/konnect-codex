@@ -10,7 +10,7 @@
 //!   get_recent_calls(limit?)  — last N tool calls (newest first) with timing + status
 //!   server_stats()            — uptime, per-tool totals/errors, JSONL log path
 //!
-//! At server startup only the STARTER_KIT (`project`, `config`) is pre-loaded so
+//! At server startup only the curated STARTER_KIT is pre-loaded so
 //! baseline context stays small. The LLM reads `list_toolboxes` and calls
 //! `load_toolset(name)` to expose the tools it actually needs for the task.
 

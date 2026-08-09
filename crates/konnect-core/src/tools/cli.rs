@@ -40,6 +40,24 @@ pub struct ErcPos {
 pub struct DrcViolation {
     pub severity: String,
     pub description: String,
+    pub code: Option<String>,
+    pub rule: Option<String>,
+    pub pos: Option<ErcPos>,
+    pub layer: Option<String>,
+    pub marker_id: Option<String>,
+    pub involved_object_count: usize,
+    pub items: Vec<DrcItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrcItem {
+    pub kiid: Option<String>,
+    pub item_type: Option<String>,
+    pub description: Option<String>,
+    pub reference: Option<String>,
+    pub pad: Option<String>,
+    pub net: Option<String>,
+    pub layer: Option<String>,
     pub pos: Option<ErcPos>,
 }
 
@@ -185,22 +203,125 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<Vec<Dr
     let raw: serde_json::Value = serde_json::from_str(&json_str)?;
     let _ = tokio::fs::remove_file(&out_path).await;
 
-    Ok(raw
-        .get("violations")
+    Ok(parse_drc_json(&raw))
+}
+
+fn optional_string(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+}
+
+fn json_pos(value: Option<&serde_json::Value>) -> Option<ErcPos> {
+    let value = value?;
+    Some(ErcPos {
+        x: value.get("x")?.as_f64()?,
+        y: value.get("y")?.as_f64()?,
+    })
+}
+
+fn parse_drc_json(raw: &serde_json::Value) -> Vec<DrcViolation> {
+    raw.get("violations")
         .and_then(|v| v.as_array())
         .unwrap_or(&vec![])
         .iter()
-        .map(|v| DrcViolation {
-            severity: v["severity"].as_str().unwrap_or("error").to_string(),
-            description: v["description"].as_str().unwrap_or("").to_string(),
-            pos: v.get("pos").and_then(|p| {
-                Some(ErcPos {
-                    x: p["x"].as_f64()?,
-                    y: p["y"].as_f64()?,
+        .map(|v| {
+            let items = v
+                .get("items")
+                .and_then(|items| items.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| DrcItem {
+                            kiid: optional_string(item.get("uuid").or_else(|| item.get("kiid"))),
+                            item_type: optional_string(
+                                item.get("type").or_else(|| item.get("item_type")),
+                            ),
+                            description: optional_string(item.get("description")),
+                            reference: optional_string(item.get("reference")),
+                            pad: optional_string(item.get("pad")),
+                            net: optional_string(item.get("net")),
+                            layer: optional_string(item.get("layer")),
+                            pos: json_pos(item.get("pos").or_else(|| item.get("location"))),
+                        })
+                        .collect::<Vec<_>>()
                 })
-            }),
+                .unwrap_or_default();
+            DrcViolation {
+                severity: v["severity"].as_str().unwrap_or("error").to_string(),
+                description: v["description"].as_str().unwrap_or("").to_string(),
+                code: optional_string(v.get("type").or_else(|| v.get("code"))),
+                rule: optional_string(v.get("rule").or_else(|| v.get("rule_name"))),
+                pos: json_pos(v.get("pos").or_else(|| v.get("location"))),
+                layer: optional_string(v.get("layer")),
+                marker_id: optional_string(v.get("marker").or_else(|| v.get("marker_id"))),
+                involved_object_count: items.len(),
+                items,
+            }
         })
-        .collect())
+        .collect()
+}
+
+/// Best-effort read-only enrichment of DRC item UUIDs from the active KiCad
+/// board. DRC remains usable when IPC is unavailable or refers to another PCB.
+pub async fn enrich_drc_items_with_ipc(violations: &mut [DrcViolation], ipc_address: &str) {
+    let ids: Vec<String> = violations
+        .iter()
+        .flat_map(|v| v.items.iter())
+        .filter_map(|item| item.kiid.clone())
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+
+    let address = ipc_address.to_owned();
+    let resolved = tokio::task::spawn_blocking(move || {
+        konnect_ipc::KiCadIpcClient::new(&address).resolve_board_item_ids(&ids)
+    })
+    .await;
+    let Ok(Ok(resolved)) = resolved else {
+        return;
+    };
+    apply_drc_item_identities(violations, resolved);
+}
+
+fn apply_drc_item_identities(
+    violations: &mut [DrcViolation],
+    resolved: Vec<konnect_ipc::types::IpcBoardItemIdentity>,
+) {
+    use std::collections::HashMap;
+
+    let by_id: HashMap<_, _> = resolved
+        .into_iter()
+        .map(|identity| (identity.kiid.clone(), identity))
+        .collect();
+
+    for item in violations.iter_mut().flat_map(|v| v.items.iter_mut()) {
+        let Some(identity) = item.kiid.as_ref().and_then(|id| by_id.get(id)) else {
+            continue;
+        };
+        item.item_type
+            .get_or_insert_with(|| identity.item_type.clone());
+        if item.reference.is_none() {
+            item.reference.clone_from(&identity.reference);
+        }
+        if item.pad.is_none() {
+            item.pad.clone_from(&identity.pad);
+        }
+        if item.net.is_none() {
+            item.net.clone_from(&identity.net);
+        }
+        if item.layer.is_none() {
+            item.layer.clone_from(&identity.layer);
+        }
+        if item.pos.is_none() {
+            item.pos = identity
+                .position
+                .as_ref()
+                .map(|p| ErcPos { x: p.x, y: p.y });
+        }
+    }
 }
 
 // ─── Annotation ───────────────────────────────────────────────────────────────
@@ -679,5 +800,104 @@ mod erc_parse_tests {
             parse_erc_json(&serde_json::json!({ "violations": [{ "severity": "error" }] }))
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod drc_parse_tests {
+    use super::*;
+
+    #[test]
+    fn retains_one_board_item_and_missing_metadata_is_null() {
+        let parsed = parse_drc_json(&serde_json::json!({
+            "violations": [{
+                "type": "clearance",
+                "severity": "error",
+                "description": "Clearance violation",
+                "items": [{
+                    "uuid": "item-1",
+                    "description": "Track [N1]",
+                    "pos": { "x": 1.25, "y": 2.5 }
+                }]
+            }]
+        }));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].code.as_deref(), Some("clearance"));
+        assert_eq!(parsed[0].involved_object_count, 1);
+        assert_eq!(parsed[0].items[0].kiid.as_deref(), Some("item-1"));
+        assert_eq!(parsed[0].items[0].pos.as_ref().unwrap().x, 1.25);
+        assert!(parsed[0].items[0].net.is_none());
+        assert!(parsed[0].rule.is_none());
+        assert!(parsed[0].marker_id.is_none());
+    }
+
+    #[test]
+    fn retains_two_objects_and_structured_metadata() {
+        let parsed = parse_drc_json(&serde_json::json!({
+            "violations": [{
+                "code": "shorting_items",
+                "rule": "copper_clearance",
+                "severity": "warning",
+                "description": "Items shorting two nets",
+                "layer": "F.Cu",
+                "marker_id": "marker-1",
+                "items": [
+                    { "kiid": "a", "item_type": "track", "net": "A" },
+                    { "kiid": "b", "item_type": "pad", "reference": "U1", "pad": "3", "net": "B" }
+                ]
+            }]
+        }));
+        let violation = &parsed[0];
+        assert_eq!(violation.involved_object_count, 2);
+        assert_eq!(violation.rule.as_deref(), Some("copper_clearance"));
+        assert_eq!(violation.layer.as_deref(), Some("F.Cu"));
+        assert_eq!(violation.marker_id.as_deref(), Some("marker-1"));
+        assert_eq!(violation.items[1].reference.as_deref(), Some("U1"));
+        assert_eq!(violation.items[1].pad.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn kiid_resolution_propagates_exact_ipc_identity_without_overwriting_report_data() {
+        let mut parsed = parse_drc_json(&serde_json::json!({
+            "violations": [{
+                "severity": "error",
+                "description": "x",
+                "items": [{ "uuid": "via-1", "net": "REPORT_NET" }]
+            }]
+        }));
+        apply_drc_item_identities(
+            &mut parsed,
+            vec![konnect_ipc::IpcBoardItemIdentity {
+                kiid: "via-1".into(),
+                item_type: "via".into(),
+                reference: None,
+                pad: None,
+                net: Some("IPC_NET".into()),
+                layer: Some("In1.Cu".into()),
+                position: Some(konnect_ipc::IpcVector2 { x: 4.0, y: 38.0 }),
+            }],
+        );
+        let item = &parsed[0].items[0];
+        assert_eq!(item.item_type.as_deref(), Some("via"));
+        assert_eq!(item.net.as_deref(), Some("REPORT_NET"));
+        assert_eq!(item.layer.as_deref(), Some("In1.Cu"));
+        assert_eq!(item.pos.as_ref().unwrap().y, 38.0);
+    }
+
+    #[test]
+    fn legacy_fields_and_aggregate_cardinality_remain_unchanged() {
+        let parsed = parse_drc_json(&serde_json::json!({
+            "violations": [
+                { "severity": "error", "description": "one" },
+                { "severity": "warning", "description": "two" }
+            ]
+        }));
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.iter().filter(|v| v.severity == "error").count(), 1);
+        assert_eq!(parsed.iter().filter(|v| v.severity == "warning").count(), 1);
+        let json = serde_json::to_value(&parsed[0]).unwrap();
+        assert_eq!(json["severity"], "error");
+        assert_eq!(json["description"], "one");
+        assert!(json.get("items").is_some());
     }
 }

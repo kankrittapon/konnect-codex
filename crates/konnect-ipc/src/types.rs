@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IpcVector2 {
     pub x: f64,
     pub y: f64,
@@ -102,6 +102,16 @@ pub struct IpcTrack {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcTrackArc {
+    pub net_name: String,
+    pub layer: String,
+    pub width: f64,
+    pub start: IpcVector2,
+    pub mid: IpcVector2,
+    pub end: IpcVector2,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcNet {
     pub name: String,
     pub netcode: i32,
@@ -118,6 +128,110 @@ pub struct IpcLayer {
 pub struct IpcBoardExtents {
     pub min: IpcVector2,
     pub max: IpcVector2,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcPadGeometry {
+    pub reference: String,
+    pub number: String,
+    pub position: IpcVector2,
+    pub size: Option<IpcVector2>,
+    pub shape: Option<String>,
+    pub rotation: f64,
+    pub corner_rounding_ratio: Option<f64>,
+    pub geometry_supported: bool,
+    pub geometry_reason: Option<String>,
+    pub layers: Vec<String>,
+    pub net_name: String,
+    pub net_id: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IpcBoardEdgeGeometry {
+    Line {
+        start: IpcVector2,
+        end: IpcVector2,
+    },
+    Arc {
+        start: IpcVector2,
+        mid: IpcVector2,
+        end: IpcVector2,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcViaGeometry {
+    pub position: IpcVector2,
+    pub size: Option<IpcVector2>,
+    pub drill: Option<IpcVector2>,
+    pub layers: Vec<String>,
+    pub net_name: String,
+    pub net_id: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcPolygonGeometry {
+    pub object_type: String,
+    pub reference: Option<String>,
+    pub layer: String,
+    pub net_name: Option<String>,
+    pub net_id: Option<i32>,
+    pub polygons: Vec<Vec<IpcVector2>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcGeometryClass<T> {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub items: T,
+}
+
+impl<T: Default> IpcGeometryClass<T> {
+    pub fn available(items: T) -> Self {
+        Self {
+            available: true,
+            reason: None,
+            items,
+        }
+    }
+
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            available: false,
+            reason: Some(reason.into()),
+            items: T::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcRoutingGeometry {
+    pub layers: IpcGeometryClass<Vec<IpcLayer>>,
+    pub board_extents: IpcGeometryClass<Option<IpcBoardExtents>>,
+    pub footprints: IpcGeometryClass<Vec<IpcFootprint>>,
+    pub pads: IpcGeometryClass<Vec<IpcPadGeometry>>,
+    pub tracks: IpcGeometryClass<Vec<IpcTrack>>,
+    pub track_arcs: IpcGeometryClass<Vec<IpcTrackArc>>,
+    pub vias: IpcGeometryClass<Vec<IpcViaGeometry>>,
+    pub courtyards: IpcGeometryClass<Vec<IpcPolygonGeometry>>,
+    pub zones: IpcGeometryClass<Vec<IpcPolygonGeometry>>,
+    pub board_edges: IpcGeometryClass<Vec<IpcBoardEdgeGeometry>>,
+}
+
+/// Read-only identity for a board item referenced by a KiCad DRC report.
+/// Optional fields stay absent when the corresponding protobuf item does not
+/// carry a single, exact value (for example, a multi-layer zone).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcBoardItemIdentity {
+    pub kiid: String,
+    pub item_type: String,
+    pub reference: Option<String>,
+    pub pad: Option<String>,
+    pub net: Option<String>,
+    pub layer: Option<String>,
+    pub position: Option<IpcVector2>,
 }
 
 /// Footprint-local placement of the Reference and Value text fields, read

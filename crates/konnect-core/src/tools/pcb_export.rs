@@ -645,7 +645,8 @@ async fn handle_get_drc_violations(
 
     let cli = &ctx.config.kicad_cli;
     let refill = args["refill_zones"].as_bool().unwrap_or(false);
-    let violations = cli::run_drc(cli, &board, refill).await?;
+    let mut violations = cli::run_drc(cli, &board, refill).await?;
+    cli::enrich_drc_items_with_ipc(&mut violations, &ctx.config.ipc_address).await;
 
     // Optionally write report
     if let Some(out_path) = args["output"].as_str() {
@@ -662,11 +663,7 @@ async fn handle_get_drc_violations(
         "total": violations.len(),
         "filtered_count": filtered.len(),
         "severity_filter": severity_filter,
-        "violations": filtered.iter().map(|v| json!({
-            "severity": v.severity,
-            "description": v.description,
-            "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y }))
-        })).collect::<Vec<_>>()
+        "violations": filtered.iter().map(|v| json!(v)).collect::<Vec<_>>()
     });
 
     Ok(CallToolResult::text(

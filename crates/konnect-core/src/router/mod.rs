@@ -130,6 +130,19 @@ mod tests {
         router.load_starter_kit().await;
         let active: std::collections::HashSet<String> =
             router.active_names().await.into_iter().collect();
+        let expected: std::collections::HashSet<String> = [
+            "config",
+            "project",
+            "pcb_board",
+            "pcb_components",
+            "pcb_routing",
+            "pcb_export",
+            "verification",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(active, expected);
         for expected in registry::STARTER_KIT {
             assert!(
                 active.contains(*expected),
@@ -137,17 +150,28 @@ mod tests {
                 expected
             );
         }
+        assert_eq!(active.len(), registry::STARTER_KIT.len());
         // On-demand toolsets must not be auto-loaded
-        assert!(!active.contains("pcb_board"));
         assert!(!active.contains("integration"));
         assert!(!active.contains("templates"));
+    }
+
+    #[tokio::test]
+    async fn starter_kit_exposes_refill_and_routing_inspection_without_dynamic_load() {
+        let router = ToolRouter::new();
+        router.load_starter_kit().await;
+
+        assert!(router.get_tool("refill_zones").await.is_some());
+        assert!(router.get_tool("get_routing_geometry").await.is_some());
+        assert!(router.get_tool("check_route_clearance").await.is_some());
+        assert!(router.get_tool("check_via_clearance").await.is_some());
     }
 
     #[tokio::test]
     async fn find_toolset_for_tool_resolves_unloaded_tools() {
         let router = ToolRouter::new();
         router.load_starter_kit().await;
-        // pcb_board is NOT in starter kit, but this lookup must still find it
+        // Lookup remains available for tools in an already-loaded PCB toolset.
         assert_eq!(
             router.find_toolset_for_tool("place_component"),
             Some("pcb_components")
@@ -190,6 +214,16 @@ mod tests {
                 defs.len()
             );
         }
+    }
+
+    #[test]
+    fn pcb_export_registry_count_matches_implementation() {
+        let meta = registry::ALL_TOOLSETS
+            .iter()
+            .find(|meta| meta.name == "pcb_export")
+            .expect("pcb_export metadata missing");
+        assert_eq!(meta.tool_count, crate::tools::pcb_export::tools().len());
+        assert_eq!(meta.tool_count, 13);
     }
 
     #[test]

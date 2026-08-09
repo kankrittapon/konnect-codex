@@ -46,6 +46,62 @@ fn layer_enum_to_name(layer: i32) -> &'static str {
     }
 }
 
+fn point(p: &kiapi::common::types::Vector2) -> IpcVector2 {
+    IpcVector2 {
+        x: nm_to_mm(p.x_nm),
+        y: nm_to_mm(p.y_nm),
+    }
+}
+
+fn polyline_points(line: &kiapi::common::types::PolyLine) -> Vec<IpcVector2> {
+    line.nodes
+        .iter()
+        .filter_map(|n| match n.geometry.as_ref()? {
+            kiapi::common::types::poly_line_node::Geometry::Point(p) => Some(point(p)),
+            // Arc nodes cannot be represented faithfully as a straight polygon here.
+            kiapi::common::types::poly_line_node::Geometry::Arc(_) => None,
+        })
+        .collect()
+}
+
+fn polyset_points(set: Option<&kiapi::common::types::PolySet>) -> Vec<Vec<IpcVector2>> {
+    set.map(|s| {
+        s.polygons
+            .iter()
+            .filter_map(|p| p.outline.as_ref())
+            .map(polyline_points)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn graphic_shape_points(
+    shape: Option<&kiapi::common::types::GraphicShape>,
+) -> Option<Vec<IpcVector2>> {
+    use kiapi::common::types::graphic_shape::Geometry;
+    match shape?.geometry.as_ref()? {
+        Geometry::Segment(s) => Some(vec![point(s.start.as_ref()?), point(s.end.as_ref()?)]),
+        Geometry::Rectangle(r) => {
+            let a = r.top_left.as_ref()?;
+            let b = r.bottom_right.as_ref()?;
+            Some(vec![
+                point(a),
+                IpcVector2 {
+                    x: nm_to_mm(b.x_nm),
+                    y: nm_to_mm(a.y_nm),
+                },
+                point(b),
+                IpcVector2 {
+                    x: nm_to_mm(a.x_nm),
+                    y: nm_to_mm(b.y_nm),
+                },
+            ])
+        }
+        Geometry::Polygon(p) => polyset_points(Some(p)).into_iter().next(),
+        _ => None,
+    }
+}
+
 /// Wrap a protobuf message into a prost_types::Any with the correct type_url.
 fn pack_any<M: Message>(msg: &M, type_name: &str) -> prost_types::Any {
     let mut buf = Vec::new();
@@ -407,6 +463,123 @@ impl KiCadIpcClient {
         } else {
             Ok(vec![])
         }
+    }
+
+    /// Resolve DRC-reported KIID values to board identity using read-only IPC
+    /// item queries. Unknown IDs are omitted rather than inferred.
+    pub fn resolve_board_item_ids(&self, ids: &[String]) -> Result<Vec<IpcBoardItemIdentity>> {
+        use kiapi::common::types::KiCadObjectType as T;
+        use std::collections::HashSet;
+
+        let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let mut resolved = Vec::new();
+        let id_value = |id: &Option<kiapi::common::types::Kiid>| {
+            id.as_ref().map(|id| id.value.clone()).unwrap_or_default()
+        };
+        let position = |p: Option<&kiapi::common::types::Vector2>| {
+            p.map(|p| IpcVector2 {
+                x: nm_to_mm(p.x_nm),
+                y: nm_to_mm(p.y_nm),
+            })
+        };
+
+        for item in self.get_items(T::KotPcbTrace)? {
+            let track = kiapi::board::types::Track::decode(item.value.as_slice())?;
+            let kiid = id_value(&track.id);
+            if wanted.contains(kiid.as_str()) {
+                resolved.push(IpcBoardItemIdentity {
+                    kiid,
+                    item_type: "track".into(),
+                    reference: None,
+                    pad: None,
+                    net: track.net.map(|n| n.name),
+                    layer: Some(layer_enum_to_name(track.layer).into()),
+                    position: None,
+                });
+            }
+        }
+        for item in self.get_items(T::KotPcbArc)? {
+            let arc = kiapi::board::types::Arc::decode(item.value.as_slice())?;
+            let kiid = id_value(&arc.id);
+            if wanted.contains(kiid.as_str()) {
+                resolved.push(IpcBoardItemIdentity {
+                    kiid,
+                    item_type: "track_arc".into(),
+                    reference: None,
+                    pad: None,
+                    net: arc.net.map(|n| n.name),
+                    layer: Some(layer_enum_to_name(arc.layer).into()),
+                    position: None,
+                });
+            }
+        }
+        for item in self.get_items(T::KotPcbVia)? {
+            let via = kiapi::board::types::Via::decode(item.value.as_slice())?;
+            let kiid = id_value(&via.id);
+            if wanted.contains(kiid.as_str()) {
+                resolved.push(IpcBoardItemIdentity {
+                    kiid,
+                    item_type: "via".into(),
+                    reference: None,
+                    pad: None,
+                    net: via.net.map(|n| n.name),
+                    layer: None,
+                    position: position(via.position.as_ref()),
+                });
+            }
+        }
+        for item in self.get_items(T::KotPcbFootprint)? {
+            let fp = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+            let reference = fp
+                .reference_field
+                .as_ref()
+                .and_then(|f| f.text.as_ref())
+                .and_then(|t| t.text.as_ref())
+                .map(|t| t.text.clone())
+                .filter(|s| !s.is_empty());
+            let fp_kiid = id_value(&fp.id);
+            if wanted.contains(fp_kiid.as_str()) {
+                resolved.push(IpcBoardItemIdentity {
+                    kiid: fp_kiid,
+                    item_type: "footprint".into(),
+                    reference: reference.clone(),
+                    pad: None,
+                    net: None,
+                    layer: Some(layer_enum_to_name(fp.layer).into()),
+                    position: position(fp.position.as_ref()),
+                });
+            }
+            for child in fp
+                .definition
+                .as_ref()
+                .map(|d| d.items.as_slice())
+                .unwrap_or_default()
+            {
+                if !child.type_url.ends_with(".Pad") {
+                    continue;
+                }
+                let pad = kiapi::board::types::Pad::decode(child.value.as_slice())?;
+                let pad_kiid = id_value(&pad.id);
+                if wanted.contains(pad_kiid.as_str()) {
+                    let layer = pad
+                        .pad_stack
+                        .as_ref()
+                        .and_then(|stack| stack.layers.first())
+                        .map(|layer| layer_enum_to_name(*layer).to_owned());
+                    resolved.push(IpcBoardItemIdentity {
+                        kiid: pad_kiid,
+                        item_type: "pad".into(),
+                        reference: reference.clone(),
+                        pad: Some(pad.number),
+                        net: pad.net.map(|n| n.name),
+                        layer,
+                        position: position(pad.position.as_ref()),
+                    });
+                }
+            }
+        }
+
+        Ok(resolved)
     }
 
     /// List all footprints on the board.
@@ -905,6 +1078,302 @@ impl KiCadIpcClient {
             }
         }
         Ok(tracks)
+    }
+
+    /// Collect read-only routing geometry from the active board.
+    pub fn get_routing_geometry(&self) -> Result<IpcRoutingGeometry> {
+        use kiapi::common::types::KiCadObjectType as T;
+
+        fn class<T: Default>(result: Result<T>) -> IpcGeometryClass<T> {
+            match result {
+                Ok(items) => IpcGeometryClass::available(items),
+                Err(error) => IpcGeometryClass::unavailable(error.to_string()),
+            }
+        }
+
+        let footprints = class(self.list_footprints());
+        let tracks = class(self.get_tracks(None, None));
+        let track_arcs = class((|| -> Result<_> {
+            let mut arcs = Vec::new();
+            for item in self.get_items(T::KotPcbArc)? {
+                let arc = kiapi::board::types::Arc::decode(item.value.as_slice())?;
+                let (Some(start), Some(mid), Some(end)) =
+                    (arc.start.as_ref(), arc.mid.as_ref(), arc.end.as_ref())
+                else {
+                    anyhow::bail!("track arc item has incomplete IPC geometry")
+                };
+                arcs.push(IpcTrackArc {
+                    net_name: arc.net.as_ref().map(|n| n.name.clone()).unwrap_or_default(),
+                    layer: layer_enum_to_name(arc.layer).to_string(),
+                    width: arc
+                        .width
+                        .as_ref()
+                        .map(|w| crate::builders::nm_to_mm(w.value_nm))
+                        .unwrap_or(0.25),
+                    start: IpcVector2 {
+                        x: nm_to_mm(start.x_nm),
+                        y: nm_to_mm(start.y_nm),
+                    },
+                    mid: IpcVector2 {
+                        x: nm_to_mm(mid.x_nm),
+                        y: nm_to_mm(mid.y_nm),
+                    },
+                    end: IpcVector2 {
+                        x: nm_to_mm(end.x_nm),
+                        y: nm_to_mm(end.y_nm),
+                    },
+                });
+            }
+            Ok(arcs)
+        })());
+        let footprint_geometry = (|| -> Result<_> {
+            let mut pads = Vec::new();
+            let mut courtyards = Vec::new();
+            for item in self.get_items(T::KotPcbFootprint)? {
+                let fp = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+                let reference = fp
+                    .reference_field
+                    .as_ref()
+                    .and_then(|f| f.text.as_ref())
+                    .and_then(|t| t.text.as_ref())
+                    .map(|t| t.text.clone())
+                    .unwrap_or_default();
+                for child in fp
+                    .definition
+                    .as_ref()
+                    .map(|d| d.items.as_slice())
+                    .unwrap_or_default()
+                {
+                    if child.type_url.ends_with(".Pad") {
+                        let pad = kiapi::board::types::Pad::decode(child.value.as_slice())?;
+                        let pos = pad.position.as_ref();
+                        let stack = pad.pad_stack.as_ref();
+                        let copper = stack.and_then(|s| s.copper_layers.first());
+                        pads.push(IpcPadGeometry {
+                            reference: reference.clone(),
+                            number: pad.number,
+                            position: IpcVector2 {
+                                x: pos.map(|p| nm_to_mm(p.x_nm)).unwrap_or(0.0),
+                                y: pos.map(|p| nm_to_mm(p.y_nm)).unwrap_or(0.0),
+                            },
+                            size: copper.and_then(|c| c.size.as_ref()).map(|s| IpcVector2 {
+                                x: nm_to_mm(s.x_nm),
+                                y: nm_to_mm(s.y_nm),
+                            }),
+                            shape: copper.map(|c| {
+                                format!(
+                                    "{:?}",
+                                    kiapi::board::types::PadStackShape::try_from(c.shape)
+                                        .unwrap_or(kiapi::board::types::PadStackShape::PssUnknown)
+                                )
+                            }),
+                            rotation: stack
+                                .and_then(|s| s.angle.as_ref())
+                                .map(|a| a.value_degrees)
+                                .unwrap_or(0.0),
+                            corner_rounding_ratio: copper.map(|c| c.corner_rounding_ratio),
+                            geometry_supported: copper
+                                .map(|c| {
+                                    matches!(
+                                        kiapi::board::types::PadStackShape::try_from(c.shape),
+                                        Ok(kiapi::board::types::PadStackShape::PssCircle
+                                            | kiapi::board::types::PadStackShape::PssRectangle
+                                            | kiapi::board::types::PadStackShape::PssOval
+                                            | kiapi::board::types::PadStackShape::PssRoundrect)
+                                    )
+                                })
+                                .unwrap_or(false),
+                            geometry_reason: copper.and_then(|c| {
+                                let shape =
+                                    kiapi::board::types::PadStackShape::try_from(c.shape).ok()?;
+                                (!matches!(
+                                    shape,
+                                    kiapi::board::types::PadStackShape::PssCircle
+                                        | kiapi::board::types::PadStackShape::PssRectangle
+                                        | kiapi::board::types::PadStackShape::PssOval
+                                        | kiapi::board::types::PadStackShape::PssRoundrect
+                                ))
+                                .then(|| format!("unsupported IPC pad shape: {shape:?}"))
+                            }),
+                            layers: stack
+                                .map(|s| {
+                                    s.layers
+                                        .iter()
+                                        .map(|l| layer_enum_to_name(*l).to_string())
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            net_name: pad.net.as_ref().map(|n| n.name.clone()).unwrap_or_default(),
+                            net_id: pad
+                                .net
+                                .as_ref()
+                                .and_then(|n| n.code.as_ref())
+                                .map(|c| c.value)
+                                .unwrap_or(0),
+                        });
+                    } else if child.type_url.ends_with(".BoardGraphicShape") {
+                        let shape =
+                            kiapi::board::types::BoardGraphicShape::decode(child.value.as_slice())?;
+                        let layer = layer_enum_to_name(shape.layer);
+                        if layer == "F.CrtYd" || layer == "B.CrtYd" {
+                            if let Some(points) = graphic_shape_points(shape.shape.as_ref()) {
+                                courtyards.push(IpcPolygonGeometry {
+                                    object_type: "courtyard".into(),
+                                    reference: Some(reference.clone()),
+                                    layer: layer.into(),
+                                    net_name: None,
+                                    net_id: None,
+                                    polygons: vec![points],
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Ok((pads, courtyards))
+        })();
+        let (pads, courtyards) = match footprint_geometry {
+            Ok((pads, courtyards)) => (
+                IpcGeometryClass::available(pads),
+                IpcGeometryClass::available(courtyards),
+            ),
+            Err(error) => {
+                let reason = error.to_string();
+                (
+                    IpcGeometryClass::unavailable(reason.clone()),
+                    IpcGeometryClass::unavailable(reason),
+                )
+            }
+        };
+
+        let vias = class((|| -> Result<_> {
+            let mut vias = Vec::new();
+            for item in self.get_items(T::KotPcbVia)? {
+                let via = kiapi::board::types::Via::decode(item.value.as_slice())?;
+                let pos = via.position.as_ref();
+                let stack = via.pad_stack.as_ref();
+                let copper = stack
+                    .and_then(|s| s.copper_layers.first())
+                    .and_then(|l| l.size.as_ref());
+                let drill = stack
+                    .and_then(|s| s.drill.as_ref())
+                    .and_then(|d| d.diameter.as_ref());
+                vias.push(IpcViaGeometry {
+                    position: IpcVector2 {
+                        x: pos.map(|p| nm_to_mm(p.x_nm)).unwrap_or(0.0),
+                        y: pos.map(|p| nm_to_mm(p.y_nm)).unwrap_or(0.0),
+                    },
+                    size: copper.map(|s| IpcVector2 {
+                        x: nm_to_mm(s.x_nm),
+                        y: nm_to_mm(s.y_nm),
+                    }),
+                    drill: drill.map(|s| IpcVector2 {
+                        x: nm_to_mm(s.x_nm),
+                        y: nm_to_mm(s.y_nm),
+                    }),
+                    layers: stack
+                        .map(|s| {
+                            s.layers
+                                .iter()
+                                .map(|l| layer_enum_to_name(*l).to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    net_name: via.net.as_ref().map(|n| n.name.clone()).unwrap_or_default(),
+                    net_id: via
+                        .net
+                        .as_ref()
+                        .and_then(|n| n.code.as_ref())
+                        .map(|c| c.value)
+                        .unwrap_or(0),
+                });
+            }
+            Ok(vias)
+        })());
+
+        let zones = class((|| -> Result<_> {
+            let mut zones = Vec::new();
+            for item in self.get_items(T::KotPcbZone)? {
+                let zone = kiapi::board::types::Zone::decode(item.value.as_slice())?;
+                let (net_name, net_id) = match zone.settings.as_ref() {
+                    Some(kiapi::board::types::zone::Settings::CopperSettings(s)) => (
+                        Some(s.net.as_ref().map(|n| n.name.clone()).unwrap_or_default()),
+                        Some(
+                            s.net
+                                .as_ref()
+                                .and_then(|n| n.code.as_ref())
+                                .map(|c| c.value)
+                                .unwrap_or(0),
+                        ),
+                    ),
+                    _ => (None, None),
+                };
+                let polygons = polyset_points(zone.outline.as_ref());
+                for layer in &zone.layers {
+                    zones.push(IpcPolygonGeometry {
+                        object_type: "zone_outline".into(),
+                        reference: None,
+                        layer: layer_enum_to_name(*layer).into(),
+                        net_name: net_name.clone(),
+                        net_id,
+                        polygons: polygons.clone(),
+                    });
+                }
+            }
+            Ok(zones)
+        })());
+
+        let board_edges = class((|| -> Result<_> {
+            use kiapi::common::types::graphic_shape::Geometry;
+            let mut edges = Vec::new();
+            for item in self.get_items(T::KotPcbShape)? {
+                let graphic =
+                    kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())?;
+                if layer_enum_to_name(graphic.layer) != "Edge.Cuts" {
+                    continue;
+                }
+                match graphic.shape.and_then(|s| s.geometry) {
+                    Some(Geometry::Segment(s)) => {
+                        if let (Some(a), Some(b)) = (s.start, s.end) {
+                            edges.push(IpcBoardEdgeGeometry::Line {
+                                start: point(&a),
+                                end: point(&b),
+                            });
+                        }
+                    }
+                    Some(Geometry::Arc(a)) => {
+                        if let (Some(start), Some(mid), Some(end)) = (a.start, a.mid, a.end) {
+                            edges.push(IpcBoardEdgeGeometry::Arc {
+                                start: point(&start),
+                                mid: point(&mid),
+                                end: point(&end),
+                            });
+                        }
+                    }
+                    Some(_) => {
+                        anyhow::bail!("unsupported Edge.Cuts primitive returned by KiCad IPC")
+                    }
+                    None => anyhow::bail!("Edge.Cuts item has no IPC geometry"),
+                }
+            }
+            Ok(edges)
+        })());
+
+        Ok(IpcRoutingGeometry {
+            layers: class(self.get_layers()),
+            board_extents: match self.get_board_extents() {
+                Ok(extents) => IpcGeometryClass::available(Some(extents)),
+                Err(error) => IpcGeometryClass::unavailable(error.to_string()),
+            },
+            footprints,
+            pads,
+            tracks,
+            track_arcs,
+            vias,
+            courtyards,
+            zones,
+            board_edges,
+        })
     }
 
     /// Move a footprint to a new position.

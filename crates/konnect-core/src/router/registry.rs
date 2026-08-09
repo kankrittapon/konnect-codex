@@ -8,15 +8,17 @@ use crate::tools::ToolDef;
 
 /// Toolsets auto-loaded when the server starts.
 ///
-/// Kept minimal so that baseline `tools/list` context stays small (~19 tools
-/// including meta-tools ≈ 2K tokens). The LLM expands its toolbelt on demand
-/// via `load_toolset(...)`.
-///
-/// Starter choices:
-/// - `project` — needed to open / create / save any project
-/// - `config` — user preferences, design rules; call `load_user_config` at session start
-pub static STARTER_KIT: &[&str] = &["project", "config"];
-
+/// This is the intentionally curated native PCB surface. Schematic, batch,
+/// integration, and manufacturing toolsets remain opt-in via `load_toolset`.
+pub static STARTER_KIT: &[&str] = &[
+    "project",
+    "config",
+    "pcb_board",
+    "pcb_components",
+    "pcb_routing",
+    "pcb_export",
+    "verification",
+];
 pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     ToolsetMeta {
         name: "project",
@@ -76,7 +78,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "pcb_routing",
         description: "Traces, vias, copper pours, net classes, differential pairs",
         category: "pcb",
-        tool_count: 12,
+        tool_count: 15,
     },
     ToolsetMeta {
         name: "pcb_export",

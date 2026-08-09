@@ -188,7 +188,8 @@ async fn handle_run_drc(
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
     let refill = args["refill_zones"].as_bool().unwrap_or(false);
-    let violations = cli::run_drc(&ctx.config.kicad_cli, &board, refill).await?;
+    let mut violations = cli::run_drc(&ctx.config.kicad_cli, &board, refill).await?;
+    cli::enrich_drc_items_with_ipc(&mut violations, &ctx.config.ipc_address).await;
 
     // Optionally write report
     if let Some(out_path) = args["output"].as_str() {
@@ -215,11 +216,7 @@ async fn handle_run_drc(
             "severity_filter": severity_filter,
             "shown": shown,
             "truncated": truncated,
-            "violations": filtered.iter().take(limit).map(|v| json!({
-                "severity": v.severity,
-                "description": v.description,
-                "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y }))
-            })).collect::<Vec<_>>()
+            "violations": filtered.iter().take(limit).map(|v| json!(v)).collect::<Vec<_>>()
         }))
         .unwrap(),
     ))
