@@ -141,19 +141,10 @@ impl Drop for McpProcess {
 fn handshake_baseline_and_full_registry_loads() {
     let mut p = McpProcess::spawn();
 
-    // Baseline tools/list: starter kit + meta-tools only (small context).
-    let list = p.request("tools/list", json!({}));
-    let baseline = list["result"]["tools"].as_array().unwrap().len();
-    assert!(
-        (10..30).contains(&baseline),
-        "baseline tools/list should be the small starter kit, got {baseline}"
-    );
-
     // list_toolboxes reports the registry; every toolset must load.
     let boxes = McpProcess::tool_body(&p.call_tool("list_toolboxes", json!({})));
-    let toolsets: Vec<String> = boxes["toolsets"]
-        .as_array()
-        .unwrap()
+    let raw_toolsets = boxes["toolsets"].as_array().unwrap();
+    let toolsets: Vec<String> = raw_toolsets
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
@@ -165,6 +156,54 @@ fn handshake_baseline_and_full_registry_loads() {
     // No license-era fields may reappear.
     assert!(boxes.get("license_tier").is_none());
     assert!(boxes["toolsets"][0].get("tier").is_none());
+
+    // Startup exposes only the curated native PCB surface; schematic,
+    // batch, integration, and manufacturing toolsets stay opt-in via
+    // load_toolset. This pins the architecture decision itself, not an
+    // implementation-detail tool count.
+    let expected_starter_kit: std::collections::HashSet<&str> = [
+        "project",
+        "config",
+        "pcb_board",
+        "pcb_components",
+        "pcb_routing",
+        "pcb_export",
+        "verification",
+    ]
+    .into_iter()
+    .collect();
+    let loaded_at_startup: std::collections::HashSet<&str> = raw_toolsets
+        .iter()
+        .filter(|t| t["loaded"].as_bool() == Some(true))
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        loaded_at_startup, expected_starter_kit,
+        "startup-loaded toolsets no longer match the intended curated starter kit"
+    );
+
+    // Baseline tools/list must equal the loaded toolsets' tools plus a
+    // small fixed set of always-present meta-tools -- asserted as a
+    // relationship, not a hardcoded count that drifts whenever an
+    // individual tool is added to an already-loaded toolset.
+    let loaded_tool_total: u64 = raw_toolsets
+        .iter()
+        .filter(|t| t["loaded"].as_bool() == Some(true))
+        .filter_map(|t| t["tool_count"].as_u64())
+        .sum();
+    let list = p.request("tools/list", json!({}));
+    let baseline = list["result"]["tools"].as_array().unwrap().len() as u64;
+    assert!(
+        baseline > loaded_tool_total,
+        "baseline tools/list ({baseline}) should exceed the loaded-toolset tool total \
+         ({loaded_tool_total}) by the fixed set of meta-tools"
+    );
+    let meta_tool_count = baseline - loaded_tool_total;
+    assert!(
+        (1..20).contains(&meta_tool_count),
+        "unexpected meta-tool count derived from baseline ({baseline}) minus loaded-toolset \
+         tools ({loaded_tool_total}): {meta_tool_count}"
+    );
 
     let mut total = 0u64;
     for name in &toolsets {
@@ -212,12 +251,15 @@ fn file_based_tool_roundtrip_in_temp_project() {
 fn structured_errors_guide_recovery() {
     let mut p = McpProcess::spawn();
 
-    // Known tool in an unloaded toolset → toolset_not_loaded naming the owner.
-    let r = p.call_tool("route_trace", json!({}));
+    // Known tool in an unloaded toolset → toolset_not_loaded naming the
+    // owner. sch_components stays opt-in even after the STARTER_KIT
+    // expansion that pulled the native PCB toolsets (incl. pcb_routing)
+    // into the default-loaded set.
+    let r = p.call_tool("add_schematic_component", json!({}));
     assert_eq!(r["isError"], json!(true));
     let body = McpProcess::tool_body(&r);
     assert_eq!(body["error"]["kind"], "toolset_not_loaded");
-    assert_eq!(body["error"]["toolset"], "pcb_routing");
+    assert_eq!(body["error"]["toolset"], "sch_components");
 
     // Unknown tool → unknown_tool.
     let r = p.call_tool("frobnicate_board", json!({}));
@@ -374,11 +416,16 @@ fn auto_load_toolsets_config_loads_and_executes_on_miss() {
     .unwrap();
     let mut p = McpProcess::spawn_in_dir(Some(tmp.path()));
 
-    // route_trace is in pcb_routing, not loaded at startup. With auto-load on,
-    // the toolset loads, a list_changed notification fires, and the call
-    // reaches the handler's own missing-argument check (net_name) instead of
-    // failing with toolset_not_loaded.
-    let lines = p.call_tool_then_fence("route_trace", json!({}));
+    // add_schematic_component is in sch_components, not loaded at startup.
+    // With auto-load on, the toolset loads, a list_changed notification
+    // fires, and the call reaches the handler's own missing-argument check
+    // instead of failing with toolset_not_loaded. `schematic` is supplied
+    // (its own validation takes an untyped path unrelated to this test) so
+    // the call reaches `lib_id`'s typed invalid_argument check.
+    let lines = p.call_tool_then_fence(
+        "add_schematic_component",
+        json!({"schematic": "unused.kicad_sch"}),
+    );
     let r = lines
         .iter()
         .find(|v| v.get("result").is_some())
@@ -387,7 +434,7 @@ fn auto_load_toolsets_config_loads_and_executes_on_miss() {
     assert_eq!(r["isError"], json!(true));
     let body = McpProcess::tool_body(&r);
     assert_eq!(body["error"]["kind"], "invalid_argument");
-    assert_eq!(body["error"]["field"], "net_name");
+    assert_eq!(body["error"]["field"], "lib_id");
 
     let saw_notification = lines.iter().any(|v| {
         v.get("method").and_then(Value::as_str) == Some("notifications/tools/list_changed")
@@ -396,5 +443,20 @@ fn auto_load_toolsets_config_loads_and_executes_on_miss() {
     assert!(
         saw_notification,
         "expected notifications/tools/list_changed after auto-load; saw: {lines:#?}"
+    );
+
+    // Positively confirm the toolset itself transitioned to loaded -- not
+    // just that the response shape happened to change.
+    let boxes = McpProcess::tool_body(&p.call_tool("list_toolboxes", json!({})));
+    let sch_components_loaded = boxes["toolsets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "sch_components")
+        .and_then(|t| t["loaded"].as_bool());
+    assert_eq!(
+        sch_components_loaded,
+        Some(true),
+        "sch_components should be loaded after auto-load triggered by the miss"
     );
 }
