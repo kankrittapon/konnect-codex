@@ -1019,7 +1019,50 @@ impl KiCadIpcClient {
 
     /// Delete a track by UUID.
     pub fn delete_track(&self, uuid: &str) -> Result<()> {
+        self.ensure_item_kind(
+            uuid,
+            kiapi::common::types::KiCadObjectType::KotPcbTrace,
+            "trace",
+        )?;
         self.delete_items(vec![uuid.to_string()])
+    }
+
+    /// Delete a via by its KiCad-native UUID.
+    pub fn delete_via(&self, uuid: &str) -> Result<()> {
+        self.ensure_item_kind(
+            uuid,
+            kiapi::common::types::KiCadObjectType::KotPcbVia,
+            "via",
+        )?;
+        self.delete_items(vec![uuid.to_string()])
+    }
+
+    fn ensure_item_kind(
+        &self,
+        uuid: &str,
+        expected: kiapi::common::types::KiCadObjectType,
+        kind: &str,
+    ) -> Result<()> {
+        let items = self.get_items(expected)?;
+        let found = match expected {
+            kiapi::common::types::KiCadObjectType::KotPcbTrace => items.iter().any(|item| {
+                kiapi::board::types::Track::decode(item.value.as_slice())
+                    .ok()
+                    .and_then(|v| v.id.map(|id| id.value == uuid))
+                    .unwrap_or(false)
+            }),
+            kiapi::common::types::KiCadObjectType::KotPcbVia => items.iter().any(|item| {
+                kiapi::board::types::Via::decode(item.value.as_slice())
+                    .ok()
+                    .and_then(|v| v.id.map(|id| id.value == uuid))
+                    .unwrap_or(false)
+            }),
+            _ => false,
+        };
+        if found {
+            return Ok(());
+        }
+        anyhow::bail!("{kind} UUID '{uuid}' was not found on the active board")
     }
 
     /// Query tracks, optionally filtered by net and/or layer.
@@ -1051,6 +1094,11 @@ impl KiCadIpcClient {
                 let start = track.start.as_ref();
                 let end = track.end.as_ref();
                 tracks.push(IpcTrack {
+                    kiid: track
+                        .id
+                        .as_ref()
+                        .map(|id| id.value.clone())
+                        .unwrap_or_default(),
                     net_name: net_name.to_string(),
                     layer: layer_name.to_string(),
                     width: track
@@ -1078,6 +1126,69 @@ impl KiCadIpcClient {
             }
         }
         Ok(tracks)
+    }
+
+    /// Query vias, optionally filtered by net name.
+    pub fn get_vias(&self, net_filter: Option<&str>) -> Result<Vec<IpcViaGeometry>> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbVia)?;
+        let mut vias = Vec::new();
+        for item in &items {
+            if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
+                let net_name = via.net.as_ref().map(|n| n.name.as_str()).unwrap_or("");
+                if let Some(nf) = net_filter {
+                    if net_name != nf {
+                        continue;
+                    }
+                }
+                let pos = via.position.as_ref();
+                let stack = via.pad_stack.as_ref();
+                let copper = stack
+                    .and_then(|s| s.copper_layers.first())
+                    .and_then(|l| l.size.as_ref());
+                let drill = stack
+                    .and_then(|s| s.drill.as_ref())
+                    .and_then(|d| d.diameter.as_ref());
+                vias.push(IpcViaGeometry {
+                    kiid: via
+                        .id
+                        .as_ref()
+                        .map(|id| id.value.clone())
+                        .unwrap_or_default(),
+                    position: IpcVector2 {
+                        x: pos
+                            .map(|p| crate::builders::nm_to_mm(p.x_nm))
+                            .unwrap_or(0.0),
+                        y: pos
+                            .map(|p| crate::builders::nm_to_mm(p.y_nm))
+                            .unwrap_or(0.0),
+                    },
+                    size: copper.map(|s| IpcVector2 {
+                        x: crate::builders::nm_to_mm(s.x_nm),
+                        y: crate::builders::nm_to_mm(s.y_nm),
+                    }),
+                    drill: drill.map(|s| IpcVector2 {
+                        x: crate::builders::nm_to_mm(s.x_nm),
+                        y: crate::builders::nm_to_mm(s.y_nm),
+                    }),
+                    layers: stack
+                        .map(|s| {
+                            s.layers
+                                .iter()
+                                .map(|l| layer_enum_to_name(*l).to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    net_name: net_name.to_string(),
+                    net_id: via
+                        .net
+                        .as_ref()
+                        .and_then(|n| n.code.as_ref())
+                        .map(|c| c.value)
+                        .unwrap_or(0),
+                });
+            }
+        }
+        Ok(vias)
     }
 
     /// Collect read-only routing geometry from the active board.
@@ -1259,6 +1370,11 @@ impl KiCadIpcClient {
                     .and_then(|s| s.drill.as_ref())
                     .and_then(|d| d.diameter.as_ref());
                 vias.push(IpcViaGeometry {
+                    kiid: via
+                        .id
+                        .as_ref()
+                        .map(|id| id.value.clone())
+                        .unwrap_or_default(),
                     position: IpcVector2 {
                         x: pos.map(|p| nm_to_mm(p.x_nm)).unwrap_or(0.0),
                         y: pos.map(|p| nm_to_mm(p.y_nm)).unwrap_or(0.0),

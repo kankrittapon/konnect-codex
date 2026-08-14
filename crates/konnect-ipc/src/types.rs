@@ -94,6 +94,8 @@ pub enum IpcGraphicDefinition {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcTrack {
+    /// KiCad-native stable object identity (KIID).
+    pub kiid: String,
     pub net_name: String,
     pub layer: String,
     pub width: f64,
@@ -162,6 +164,8 @@ pub enum IpcBoardEdgeGeometry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcViaGeometry {
+    /// KiCad-native stable object identity (KIID).
+    pub kiid: String,
     pub position: IpcVector2,
     pub size: Option<IpcVector2>,
     pub drill: Option<IpcVector2>,

@@ -248,6 +248,15 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_delete_trace(args, ctx).await }
         ),
         tool!(
+            "delete_via",
+            "Delete a via identified by its KiCad-native UUID via KiCAD IPC.",
+            json!({"type":"object","properties":{
+                "board":{"type":"string"},
+                "uuid":{"type":"string","description":"UUID of the via to delete"}
+            },"required":["board","uuid"]}),
+            |args, ctx| async move { handle_delete_via(args, ctx).await }
+        ),
+        tool!(
             "query_traces",
             "List trace segments on the board, optionally filtered by net and/or layer.",
             json!({
@@ -260,6 +269,14 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_query_traces(args, ctx).await }
+        ),
+        tool!(
+            "query_vias",
+            "List vias on the board, optionally filtered by net; each record includes its KiCad-native UUID.",
+            json!({"type":"object","properties":{
+                "board":{"type":"string"},"net_name":{"type":"string"}
+            },"required":["board"]}),
+            |args, ctx| async move { handle_query_vias(args, ctx).await }
         ),
         tool!(
             "get_nets_list",
@@ -1624,20 +1641,44 @@ async fn handle_delete_trace(
     Ok(CallToolResult::json(&json!({ "deleted_uuid": uuid })))
 }
 
+async fn handle_delete_via(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let uuid = match require_str(args, "uuid") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let board = get_path(args, "board")?;
+    let uuid_ipc = uuid.clone();
+    ipc!(ctx, |c| {
+        c.ensure_board_is_active(&board)?;
+        c.delete_via(&uuid_ipc)
+    });
+    Ok(CallToolResult::json(
+        &json!({"deleted_uuid":uuid,"item_type":"via"}),
+    ))
+}
+
 async fn handle_query_traces(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let net = args["net_name"].as_str().map(String::from);
     let layer = args["layer"].as_str().map(String::from);
+    let board = get_path(args, "board")?;
 
-    let tracks = ipc!(ctx, |c| { c.get_tracks(net.as_deref(), layer.as_deref()) });
+    let tracks = ipc!(ctx, |c| {
+        c.ensure_board_is_active(&board)?;
+        c.get_tracks(net.as_deref(), layer.as_deref())
+    });
 
     let items: Vec<serde_json::Value> = tracks
         .iter()
         .map(|t| {
             json!({
                 "net": t.net_name, "layer": t.layer, "width": t.width,
+                "uuid": t.kiid,
                 "x1": t.start.x, "y1": t.start.y,
                 "x2": t.end.x,   "y2": t.end.y
             })
@@ -1646,6 +1687,21 @@ async fn handle_query_traces(
 
     Ok(CallToolResult::json(
         &json!({ "count": items.len(), "traces": items }),
+    ))
+}
+
+async fn handle_query_vias(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let net = args["net_name"].as_str().map(String::from);
+    let board = get_path(args, "board")?;
+    let vias = ipc!(ctx, |c| {
+        c.ensure_board_is_active(&board)?;
+        c.get_vias(net.as_deref())
+    });
+    Ok(CallToolResult::json(
+        &json!({"count":vias.len(),"vias":vias}),
     ))
 }
 
@@ -1956,6 +2012,7 @@ mod routing_inspection_tests {
     fn geometry_without_bounds() -> IpcRoutingGeometry {
         let mut geometry = empty_geometry();
         geometry.tracks = IpcGeometryClass::available(vec![IpcTrack {
+            kiid: "track-test".into(),
             net_name: "GND".into(),
             layer: "F.Cu".into(),
             width: 0.25,
@@ -2154,6 +2211,7 @@ mod routing_inspection_tests {
     fn supported_foreign_track_and_pad_collisions_fail() {
         let mut track_geometry = empty_geometry();
         track_geometry.tracks.items.push(IpcTrack {
+            kiid: "track-test-2".into(),
             net_name: "OTHER".into(),
             layer: "F.Cu".into(),
             width: 0.2,
@@ -2311,6 +2369,7 @@ mod routing_inspection_tests {
     fn foreign_via_still_collides() {
         let mut geometry = empty_geometry();
         geometry.vias.items = vec![IpcViaGeometry {
+            kiid: "via-test".into(),
             position: IpcVector2 { x: 0.5, y: 0.0 },
             size: Some(IpcVector2 { x: 0.8, y: 0.8 }),
             drill: Some(IpcVector2 { x: 0.4, y: 0.4 }),
@@ -2475,6 +2534,8 @@ mod routing_inspection_tests {
         assert!(names.iter().any(|n| *n == "get_routing_geometry"));
         assert!(names.iter().any(|n| *n == "check_route_clearance"));
         assert!(names.iter().any(|n| *n == "check_via_clearance"));
+        assert!(names.iter().any(|n| *n == "query_vias"));
+        assert!(names.iter().any(|n| *n == "delete_via"));
     }
 
     #[test]
