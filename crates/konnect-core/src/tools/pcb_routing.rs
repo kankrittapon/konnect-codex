@@ -1069,15 +1069,26 @@ async fn handle_check_route_clearance(
         json!("Ordinary courtyard curves and containment are not clearance-checked."),
     ];
     let collision_free = report.conflicts.is_empty();
-    let globally_safe = collision_free
-        && required_copper_supported
-        && board_edge_check_passed
-        && encountered_unsupported_geometry.is_empty();
+    let unsupported_geometry_encountered = !encountered_unsupported_geometry.is_empty();
+    let blocking_reasons = safety_blocking_reasons(
+        collision_free,
+        required_copper_supported,
+        board_edge_check_passed,
+        unsupported_geometry_encountered,
+    );
+    let globally_safe = blocking_reasons.is_empty();
     Ok(CallToolResult::json(&json!({
         "collision_free_against_checked_geometry": collision_free,
         "globally_safe": globally_safe,
         "required_copper_checks_supported": required_copper_supported,
         "board_edge_check": board_edge_check,
+        "safety_contributors": {
+            "collision_free": collision_free,
+            "required_copper_checks_supported": required_copper_supported,
+            "board_edge_check_passed": board_edge_check_passed,
+            "unsupported_geometry_encountered": unsupported_geometry_encountered
+        },
+        "blocking_reasons": blocking_reasons,
         "geometry_availability": {"layers":g.layers,"tracks":g.tracks,"track_arcs":g.track_arcs,"pads":g.pads,"vias":g.vias,"courtyards":g.courtyards,"zones":g.zones,"board_edges":g.board_edges,"board_bounds":g.board_extents},
         "read_only": true, "net":net,"layer":layer,"trace_width":width,"required_clearance":clearance,
         "minimum_clearance": if report.minimum.is_finite(){Some(report.minimum)}else{None},
@@ -1088,6 +1099,28 @@ async fn handle_check_route_clearance(
         "allowed_endpoint_pads":allowed_endpoint_pads.iter().map(|p| json!({"reference":p.reference,"pad":p.pad})).collect::<Vec<_>>(),
         "unsupported_checks": unsupported_capabilities.clone()
     })))
+}
+
+fn safety_blocking_reasons(
+    collision_free: bool,
+    required_copper_checks_supported: bool,
+    board_edge_check_passed: bool,
+    unsupported_geometry_encountered: bool,
+) -> Vec<serde_json::Value> {
+    let mut reasons = Vec::new();
+    if !collision_free {
+        reasons.push(json!("blocking_collision"));
+    }
+    if !required_copper_checks_supported {
+        reasons.push(json!("required_copper_checks_unsupported"));
+    }
+    if !board_edge_check_passed {
+        reasons.push(json!("board_edge_check_failed_or_unsupported"));
+    }
+    if unsupported_geometry_encountered {
+        reasons.push(json!("encountered_unsupported_geometry"));
+    }
+    reasons
 }
 
 fn copper_layer_index(layer: &str) -> Option<usize> {
@@ -1960,6 +1993,26 @@ mod routing_inspection_tests {
             &[(1.0, 1.0), (3.0, 1.0)],
             "F.Cu"
         ));
+    }
+
+    #[test]
+    fn legal_endpoint_safety_attribution_is_empty() {
+        let reasons = safety_blocking_reasons(true, true, true, false);
+        assert!(reasons.is_empty());
+    }
+
+    #[test]
+    fn failed_safety_attribution_identifies_each_contributor() {
+        let reasons = safety_blocking_reasons(false, false, false, true);
+        assert_eq!(
+            reasons,
+            vec![
+                json!("blocking_collision"),
+                json!("required_copper_checks_unsupported"),
+                json!("board_edge_check_failed_or_unsupported"),
+                json!("encountered_unsupported_geometry"),
+            ]
+        );
     }
 
     #[test]
