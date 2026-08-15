@@ -776,6 +776,83 @@ fn calculate_clearance(
     }
 }
 
+/// Exact (non-sampled) minimum distance from a route segment to a closed
+/// polygon: 0.0 if either endpoint lies inside the polygon (covers the
+/// segment-fully-contained case, since a boundary-crossing segment already
+/// hits 0.0 via the edge-distance check below), otherwise the minimum
+/// segment-to-edge distance over every polygon edge.
+fn segment_polygon_distance(a: (f64, f64), b: (f64, f64), polygon: &[IpcVector2]) -> f64 {
+    if polygon.len() < 3 {
+        return f64::INFINITY;
+    }
+    if point_in_polygon(a, polygon) || point_in_polygon(b, polygon) {
+        return 0.0;
+    }
+    polygon
+        .iter()
+        .cycle()
+        .take(polygon.len() + 1)
+        .collect::<Vec<_>>()
+        .windows(2)
+        .map(|edge| segment_distance(a, b, (edge[0].x, edge[0].y), (edge[1].x, edge[1].y)))
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Checks a candidate route against native `keepout_tracks = true` rule areas
+/// applicable to `layer`, using the same exact segment/polygon primitives as
+/// the rest of this preflight (no point sampling). Rule areas that don't
+/// apply to this layer, or that don't restrict tracks, never block the route.
+fn rule_area_conflicts(
+    rule_areas: &[konnect_ipc::IpcRuleArea],
+    points: &[(f64, f64)],
+    layer: &str,
+    width: f64,
+    clearance: f64,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let mut conflicts = Vec::new();
+    let mut unsupported = Vec::new();
+
+    for ra in rule_areas
+        .iter()
+        .filter(|ra| ra.keepout_tracks && ra.layers.iter().any(|l| l == layer))
+    {
+        if ra.bounds.is_empty() || ra.bounds.iter().any(|polygon| polygon.len() < 3) {
+            unsupported.push(json!({
+                "object_type": "unsupported_rule_area",
+                "kiid": ra.kiid,
+                "owner": ra.owner,
+                "footprint_reference": ra.footprint_reference,
+                "layer": layer,
+                "reason": "rule-area outline geometry is unavailable or degenerate"
+            }));
+            continue;
+        }
+        let distance = points
+            .windows(2)
+            .flat_map(|pair| {
+                ra.bounds
+                    .iter()
+                    .map(move |polygon| segment_polygon_distance(pair[0], pair[1], polygon))
+            })
+            .fold(f64::INFINITY, f64::min);
+        let gap = distance - width / 2.0;
+        if gap < clearance {
+            conflicts.push(json!({
+                "object_type": "rule_area",
+                "kiid": ra.kiid,
+                "owner": ra.owner,
+                "footprint_reference": ra.footprint_reference,
+                "layers": ra.layers,
+                "restriction": "tracks_not_allowed",
+                "distance": gap,
+                "required_clearance": clearance
+            }));
+        }
+    }
+
+    (conflicts, unsupported)
+}
+
 fn segment_bbox(points: &[(f64, f64)], margin: f64) -> (f64, f64, f64, f64) {
     let (mut min_x, mut max_x, mut min_y, mut max_y) = (
         f64::INFINITY,
@@ -1064,6 +1141,11 @@ async fn handle_check_route_clearance(
         Ok(g) => g,
         Err(e) => return Ok(e),
     };
+    let board = get_path(args, "board")?;
+    let rule_areas_query = ipc!(ctx, |c| {
+        c.ensure_board_is_active(&board)?;
+        c.get_rule_areas(None)
+    });
     let report = calculate_clearance(
         &g,
         &points,
@@ -1073,13 +1155,16 @@ async fn handle_check_route_clearance(
         clearance,
         &allowed_endpoint_pads,
     );
+    let (rule_area_conflict_items, rule_area_unsupported) =
+        rule_area_conflicts(&rule_areas_query, &points, &layer, width, clearance);
     let route_layer_supported =
         g.layers.available && g.layers.items.iter().any(|l| l.name == layer);
     let required_copper_supported =
         g.tracks.available && g.pads.available && g.vias.available && route_layer_supported;
     let board_edge_check = board_edge_check_status(&g);
-    let encountered_unsupported_geometry =
+    let mut encountered_unsupported_geometry =
         candidate_unsupported_geometry(&g, &points, &layer, width, clearance, &net);
+    encountered_unsupported_geometry.extend(rule_area_unsupported);
     let board_edge_check_passed = g.board_edges.available
         && !report
             .conflicts
@@ -1089,11 +1174,12 @@ async fn handle_check_route_clearance(
         json!("Custom, trapezoid, and chamfered-rectangle pad geometry is unsupported."),
         json!("Track arcs are reported but exact arc clearance is unsupported."),
         json!("Copper-zone filled polygons, holes, and fill-rule details are not modeled."),
-        json!("Rule areas and KiCad design-rule/netclass overrides are not clearance-checked."),
+        json!("Rule areas with keepout_tracks=true are checked on the proposed route layer using exact segment/polygon geometry; rule-area restrictions on vias, pads, footprints, or copper pours are not evaluated by this trace-only preflight, and per-rule-area clearance overrides are not modeled (the caller's required_clearance is applied uniformly)."),
         json!("Unsupported Edge.Cuts primitive types are not modeled."),
         json!("Ordinary courtyard curves and containment are not clearance-checked."),
     ];
-    let collision_free = report.conflicts.is_empty();
+    let rule_areas_clear = rule_area_conflict_items.is_empty();
+    let collision_free = report.conflicts.is_empty() && rule_areas_clear;
     let unsupported_geometry_encountered = !encountered_unsupported_geometry.is_empty();
     let blocking_reasons = safety_blocking_reasons(
         collision_free,
@@ -1102,6 +1188,8 @@ async fn handle_check_route_clearance(
         unsupported_geometry_encountered,
     );
     let globally_safe = blocking_reasons.is_empty();
+    let mut collisions = report.conflicts;
+    collisions.extend(rule_area_conflict_items);
     Ok(CallToolResult::json(&json!({
         "collision_free_against_checked_geometry": collision_free,
         "globally_safe": globally_safe,
@@ -1111,13 +1199,14 @@ async fn handle_check_route_clearance(
             "collision_free": collision_free,
             "required_copper_checks_supported": required_copper_supported,
             "board_edge_check_passed": board_edge_check_passed,
+            "rule_areas_clear": rule_areas_clear,
             "unsupported_geometry_encountered": unsupported_geometry_encountered
         },
         "blocking_reasons": blocking_reasons,
         "geometry_availability": {"layers":g.layers,"tracks":g.tracks,"track_arcs":g.track_arcs,"pads":g.pads,"vias":g.vias,"courtyards":g.courtyards,"zones":g.zones,"board_edges":g.board_edges,"board_bounds":g.board_extents},
         "read_only": true, "net":net,"layer":layer,"trace_width":width,"required_clearance":clearance,
         "minimum_clearance": if report.minimum.is_finite(){Some(report.minimum)}else{None},
-        "collisions":report.conflicts,
+        "collisions":collisions,
         "courtyard_intersections":report.courtyard_intersections,
         "unsupported_capabilities": unsupported_capabilities,
         "encountered_unsupported_geometry": encountered_unsupported_geometry,
@@ -1970,6 +2059,240 @@ async fn handle_route_diff_pair(
         "net_pos": net_pos, "net_neg": net_neg,
         "layer": layer, "width": width, "gap": gap
     })))
+}
+
+#[cfg(test)]
+mod rule_area_preflight_tests {
+    use super::*;
+    use konnect_ipc::IpcRuleArea;
+
+    fn square(x1: f64, y1: f64, x2: f64, y2: f64) -> Vec<IpcVector2> {
+        vec![
+            IpcVector2 { x: x1, y: y1 },
+            IpcVector2 { x: x2, y: y1 },
+            IpcVector2 { x: x2, y: y2 },
+            IpcVector2 { x: x1, y: y2 },
+        ]
+    }
+
+    fn area(
+        kiid: &str,
+        layers: &[&str],
+        bounds: Vec<Vec<IpcVector2>>,
+        keepout_tracks: bool,
+        owner: &str,
+    ) -> IpcRuleArea {
+        IpcRuleArea {
+            kiid: kiid.into(),
+            name: String::new(),
+            layers: layers.iter().map(|l| l.to_string()).collect(),
+            bounds,
+            keepout_copper: true,
+            keepout_vias: true,
+            keepout_tracks,
+            keepout_pads: true,
+            keepout_footprints: false,
+            owner: owner.into(),
+            footprint_kiid: if owner == "footprint" {
+                Some("fp-kiid".into())
+            } else {
+                None
+            },
+            footprint_reference: if owner == "footprint" {
+                Some("U1".into())
+            } else {
+                None
+            },
+        }
+    }
+
+    // A. route completely outside a tracks-not-allowed rule area -> PASS
+    #[test]
+    fn route_outside_rule_area_passes() {
+        let ra = area(
+            "ra-1",
+            &["B.Cu"],
+            vec![square(10.0, 10.0, 12.0, 12.0)],
+            true,
+            "board",
+        );
+        let (conflicts, unsupported) =
+            rule_area_conflicts(&[ra], &[(0.0, 0.0), (5.0, 0.0)], "B.Cu", 0.2, 0.2);
+        assert!(conflicts.is_empty());
+        assert!(unsupported.is_empty());
+    }
+
+    // B. route close to the rule area but with legal full-width clearance -> PASS
+    #[test]
+    fn route_with_legal_edge_clearance_passes() {
+        let ra = area(
+            "ra-2",
+            &["B.Cu"],
+            vec![square(10.0, 0.0, 12.0, 2.0)],
+            true,
+            "board",
+        );
+        // centerline at y=0 is 0 mm from the box in y, but the box starts at x=10;
+        // route runs along y=-0.5 (0.5mm south of the box), width 0.2 -> edge at
+        // y=-0.4, gap to box edge (y=0) is 0.4mm, well above the 0.2mm requirement.
+        let (conflicts, _) =
+            rule_area_conflicts(&[ra], &[(9.0, -0.5), (13.0, -0.5)], "B.Cu", 0.2, 0.2);
+        assert!(conflicts.is_empty());
+    }
+
+    // C. rule area on an unrelated layer -> PASS
+    #[test]
+    fn rule_area_on_unrelated_layer_does_not_block() {
+        let ra = area(
+            "ra-3",
+            &["F.Cu"],
+            vec![square(-5.0, -5.0, 5.0, 5.0)],
+            true,
+            "board",
+        );
+        let (conflicts, unsupported) =
+            rule_area_conflicts(&[ra], &[(0.0, 0.0), (1.0, 1.0)], "B.Cu", 0.2, 0.2);
+        assert!(conflicts.is_empty());
+        assert!(unsupported.is_empty());
+    }
+
+    // D. rule area with keepout_tracks = false -> PASS (never applicable to routing)
+    #[test]
+    fn keepout_tracks_false_never_blocks() {
+        let ra = area(
+            "ra-4",
+            &["B.Cu"],
+            vec![square(-5.0, -5.0, 5.0, 5.0)],
+            false,
+            "board",
+        );
+        let (conflicts, unsupported) =
+            rule_area_conflicts(&[ra], &[(0.0, 0.0), (1.0, 1.0)], "B.Cu", 0.2, 0.2);
+        assert!(conflicts.is_empty());
+        assert!(unsupported.is_empty());
+    }
+
+    // E. footprint-owned rule area behaves equivalently to board-owned
+    #[test]
+    fn footprint_owned_rule_area_blocks_the_same_as_board_owned() {
+        let ra = area(
+            "ra-5",
+            &["B.Cu"],
+            vec![square(-1.0, -1.0, 1.0, 1.0)],
+            true,
+            "footprint",
+        );
+        let (conflicts, _) =
+            rule_area_conflicts(&[ra], &[(-5.0, 0.0), (5.0, 0.0)], "B.Cu", 0.2, 0.2);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0]["owner"], "footprint");
+        assert_eq!(conflicts[0]["footprint_reference"], "U1");
+    }
+
+    // Negative A. route centerline crosses the rule area -> FAIL
+    #[test]
+    fn centerline_crossing_rule_area_fails() {
+        let ra = area(
+            "ra-6",
+            &["B.Cu"],
+            vec![square(-1.0, -1.0, 1.0, 1.0)],
+            true,
+            "board",
+        );
+        let (conflicts, _) =
+            rule_area_conflicts(&[ra], &[(-5.0, 0.0), (5.0, 0.0)], "B.Cu", 0.2, 0.2);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0]["kiid"], "ra-6");
+        assert_eq!(conflicts[0]["restriction"], "tracks_not_allowed");
+    }
+
+    // Negative B. centerline stays outside but the trace's copper (half-width)
+    // still intersects the boundary -> FAIL. This is the case a centerline-only
+    // check would incorrectly pass.
+    #[test]
+    fn trace_edge_only_violation_fails() {
+        let ra = area(
+            "ra-7",
+            &["B.Cu"],
+            vec![square(10.0, 0.0, 12.0, 2.0)],
+            true,
+            "board",
+        );
+        // centerline at y=-0.15 clears the box's y=0 edge by 0.15mm, but a
+        // 0.2mm-wide trace has a half-width of 0.1mm, and 0.2mm clearance is
+        // required, so the actual copper-to-boundary gap is only 0.05mm.
+        let (conflicts, _) =
+            rule_area_conflicts(&[ra], &[(9.0, -0.15), (13.0, -0.15)], "B.Cu", 0.2, 0.2);
+        assert_eq!(conflicts.len(), 1);
+    }
+
+    // Negative C. route touches the prohibited boundary exactly -> FAIL
+    #[test]
+    fn route_touching_boundary_fails() {
+        let ra = area(
+            "ra-8",
+            &["B.Cu"],
+            vec![square(0.0, 0.0, 5.0, 5.0)],
+            true,
+            "board",
+        );
+        // Centerline runs exactly along the box's edge (distance 0), so even
+        // a zero-clearance requirement cannot pass (0 < 0 is false, but the
+        // half-width alone already violates any positive clearance).
+        let (conflicts, _) =
+            rule_area_conflicts(&[ra], &[(-1.0, 0.0), (6.0, 0.0)], "B.Cu", 0.2, 0.2);
+        assert_eq!(conflicts.len(), 1);
+    }
+
+    // Negative D. multiple rule areas, only one blocking -> FAIL with the correct KIID
+    #[test]
+    fn multiple_rule_areas_reports_the_correct_blocking_kiid() {
+        let far = area(
+            "ra-far",
+            &["B.Cu"],
+            vec![square(100.0, 100.0, 101.0, 101.0)],
+            true,
+            "board",
+        );
+        let blocking = area(
+            "ra-blocking",
+            &["B.Cu"],
+            vec![square(-1.0, -1.0, 1.0, 1.0)],
+            true,
+            "board",
+        );
+        let (conflicts, _) = rule_area_conflicts(
+            &[far, blocking],
+            &[(-5.0, 0.0), (5.0, 0.0)],
+            "B.Cu",
+            0.2,
+            0.2,
+        );
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0]["kiid"], "ra-blocking");
+    }
+
+    // Negative F. unsupported geometry (degenerate outline) fails closed —
+    // reported as unsupported, never a silent PASS.
+    #[test]
+    fn degenerate_outline_is_reported_unsupported_not_silently_passed() {
+        let ra = area(
+            "ra-9",
+            &["B.Cu"],
+            vec![vec![
+                IpcVector2 { x: 0.0, y: 0.0 },
+                IpcVector2 { x: 1.0, y: 1.0 },
+            ]],
+            true,
+            "board",
+        );
+        let (conflicts, unsupported) =
+            rule_area_conflicts(&[ra], &[(-5.0, 0.0), (5.0, 0.0)], "B.Cu", 0.2, 0.2);
+        assert!(conflicts.is_empty());
+        assert_eq!(unsupported.len(), 1);
+        assert_eq!(unsupported[0]["object_type"], "unsupported_rule_area");
+        assert_eq!(unsupported[0]["kiid"], "ra-9");
+    }
 }
 
 #[cfg(test)]
