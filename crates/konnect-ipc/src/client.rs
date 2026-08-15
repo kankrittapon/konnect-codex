@@ -1191,6 +1191,111 @@ impl KiCadIpcClient {
         Ok(vias)
     }
 
+    /// Convert a native `Zone` into an [`IpcRuleArea`], returning `None` if it is
+    /// not a rule area (e.g. an ordinary copper-pour zone) or fails the layer filter.
+    fn zone_to_rule_area(
+        zone: &kiapi::board::types::Zone,
+        layer_filter: Option<&str>,
+        owner: &str,
+        footprint_kiid: Option<String>,
+        footprint_reference: Option<String>,
+    ) -> Option<IpcRuleArea> {
+        let kiapi::board::types::zone::Settings::RuleAreaSettings(settings) =
+            zone.settings.as_ref()?
+        else {
+            return None;
+        };
+        let layers: Vec<String> = zone
+            .layers
+            .iter()
+            .map(|l| layer_enum_to_name(*l).to_string())
+            .collect();
+        if let Some(lf) = layer_filter {
+            if !layers.iter().any(|l| l == lf) {
+                return None;
+            }
+        }
+        Some(IpcRuleArea {
+            kiid: zone
+                .id
+                .as_ref()
+                .map(|id| id.value.clone())
+                .unwrap_or_default(),
+            name: zone.name.clone(),
+            layers,
+            bounds: polyset_points(zone.outline.as_ref()),
+            keepout_copper: settings.keepout_copper,
+            keepout_vias: settings.keepout_vias,
+            keepout_tracks: settings.keepout_tracks,
+            keepout_pads: settings.keepout_pads,
+            keepout_footprints: settings.keepout_footprints,
+            owner: owner.to_string(),
+            footprint_kiid,
+            footprint_reference,
+        })
+    }
+
+    /// Query rule areas / keepouts, optionally filtered by layer.
+    ///
+    /// Distinct from copper-pour zones: only zones with `RuleAreaSettings` are
+    /// returned. Covers both board-level rule areas (top-level `KotPcbZone`
+    /// items) and rule areas embedded inside a footprint's own definition
+    /// (`FootprintInstance.definition.items`), which are NOT surfaced by
+    /// `get_items(KotPcbZone)` alone.
+    pub fn get_rule_areas(&self, layer_filter: Option<&str>) -> Result<Vec<IpcRuleArea>> {
+        use kiapi::common::types::KiCadObjectType as T;
+
+        let mut rule_areas = Vec::new();
+
+        // Board-owned rule areas.
+        for item in self.get_items(T::KotPcbZone)? {
+            let Ok(zone) = kiapi::board::types::Zone::decode(item.value.as_slice()) else {
+                continue;
+            };
+            if let Some(ra) = Self::zone_to_rule_area(&zone, layer_filter, "board", None, None) {
+                rule_areas.push(ra);
+            }
+        }
+
+        // Footprint-owned rule areas embedded in each footprint's definition.
+        for item in self.get_items(T::KotPcbFootprint)? {
+            let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let fp_kiid = fp.id.as_ref().map(|id| id.value.clone());
+            let fp_reference = fp
+                .reference_field
+                .as_ref()
+                .and_then(|f| f.text.as_ref())
+                .and_then(|t| t.text.as_ref())
+                .map(|t| t.text.clone())
+                .filter(|s| !s.is_empty());
+            let Some(children) = fp.definition.as_ref().map(|d| d.items.as_slice()) else {
+                continue;
+            };
+            for child in children {
+                if !child.type_url.ends_with(".Zone") {
+                    continue;
+                }
+                let Ok(zone) = kiapi::board::types::Zone::decode(child.value.as_slice()) else {
+                    continue;
+                };
+                if let Some(ra) = Self::zone_to_rule_area(
+                    &zone,
+                    layer_filter,
+                    "footprint",
+                    fp_kiid.clone(),
+                    fp_reference.clone(),
+                ) {
+                    rule_areas.push(ra);
+                }
+            }
+        }
+
+        Ok(rule_areas)
+    }
+
     /// Collect read-only routing geometry from the active board.
     pub fn get_routing_geometry(&self) -> Result<IpcRoutingGeometry> {
         use kiapi::common::types::KiCadObjectType as T;
@@ -2192,6 +2297,147 @@ mod document_path_tests {
             Path::new("/work/controller/other.kicad_pcb"),
             Path::new("controller.kicad_pcb")
         ));
+    }
+}
+
+#[cfg(test)]
+mod rule_area_tests {
+    use super::*;
+
+    fn rule_area_zone(
+        keepout_tracks: bool,
+        keepout_vias: bool,
+        keepout_copper: bool,
+        keepout_pads: bool,
+        keepout_footprints: bool,
+    ) -> kiapi::board::types::Zone {
+        kiapi::board::types::Zone {
+            id: Some(kiapi::common::types::Kiid {
+                value: "11111111-1111-1111-1111-111111111111".into(),
+            }),
+            r#type: kiapi::board::types::ZoneType::ZtRuleArea as i32,
+            layers: vec![kiapi::board::types::BoardLayer::BlFCu as i32],
+            outline: Some(kiapi::common::types::PolySet {
+                polygons: vec![kiapi::common::types::PolygonWithHoles {
+                    outline: Some(kiapi::common::types::PolyLine {
+                        nodes: vec![node(0, 0), node(1_000_000, 0), node(1_000_000, 1_000_000)],
+                        closed: true,
+                    }),
+                    holes: vec![],
+                }],
+            }),
+            name: "TestKeepout".into(),
+            settings: Some(kiapi::board::types::zone::Settings::RuleAreaSettings(
+                kiapi::board::types::RuleAreaSettings {
+                    keepout_copper,
+                    keepout_vias,
+                    keepout_tracks,
+                    keepout_pads,
+                    keepout_footprints,
+                    placement_enabled: false,
+                    placement_source_type: 0,
+                    placement_source: String::new(),
+                },
+            )),
+            priority: 0,
+            filled: false,
+            filled_polygons: vec![],
+            border: None,
+            locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+            layer_properties: vec![],
+        }
+    }
+
+    fn node(x_nm: i64, y_nm: i64) -> kiapi::common::types::PolyLineNode {
+        kiapi::common::types::PolyLineNode {
+            geometry: Some(kiapi::common::types::poly_line_node::Geometry::Point(
+                kiapi::common::types::Vector2 { x_nm, y_nm },
+            )),
+        }
+    }
+
+    fn copper_zone() -> kiapi::board::types::Zone {
+        let mut z = rule_area_zone(false, false, false, false, false);
+        z.r#type = kiapi::board::types::ZoneType::ZtCopper as i32;
+        z.settings = Some(kiapi::board::types::zone::Settings::CopperSettings(
+            kiapi::board::types::CopperZoneSettings::default(),
+        ));
+        z
+    }
+
+    #[test]
+    fn ordinary_copper_zone_is_excluded() {
+        let zone = copper_zone();
+        assert!(
+            KiCadIpcClient::zone_to_rule_area(&zone, None, "board", None, None).is_none(),
+            "a CopperZoneSettings zone must never be reported as a rule area"
+        );
+    }
+
+    #[test]
+    fn rule_area_is_included_with_expected_fields() {
+        let zone = rule_area_zone(true, true, false, false, true);
+        let ra = KiCadIpcClient::zone_to_rule_area(&zone, None, "board", None, None)
+            .expect("RuleAreaSettings zone must be included");
+        assert_eq!(ra.kiid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(ra.name, "TestKeepout");
+        assert_eq!(ra.layers, vec!["F.Cu".to_string()]);
+        assert!(ra.keepout_tracks);
+        assert!(ra.keepout_vias);
+        assert!(!ra.keepout_copper);
+        assert!(!ra.keepout_pads);
+        assert!(ra.keepout_footprints);
+        assert_eq!(ra.owner, "board");
+        assert!(ra.footprint_kiid.is_none());
+    }
+
+    #[test]
+    fn geometry_bounds_are_preserved() {
+        let zone = rule_area_zone(true, false, false, false, false);
+        let ra = KiCadIpcClient::zone_to_rule_area(&zone, None, "board", None, None).unwrap();
+        assert_eq!(ra.bounds.len(), 1);
+        assert_eq!(ra.bounds[0].len(), 3);
+        // nm -> mm conversion applied, same helper used by tracks/vias.
+        assert!((ra.bounds[0][1].x - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn layer_filter_matching_layer_is_included() {
+        let zone = rule_area_zone(true, false, false, false, false);
+        assert!(
+            KiCadIpcClient::zone_to_rule_area(&zone, Some("F.Cu"), "board", None, None).is_some()
+        );
+    }
+
+    #[test]
+    fn layer_filter_non_matching_layer_is_excluded() {
+        let zone = rule_area_zone(true, false, false, false, false);
+        assert!(
+            KiCadIpcClient::zone_to_rule_area(&zone, Some("B.Cu"), "board", None, None).is_none()
+        );
+    }
+
+    #[test]
+    fn footprint_owner_fields_are_attached() {
+        let zone = rule_area_zone(false, false, false, false, false);
+        let ra = KiCadIpcClient::zone_to_rule_area(
+            &zone,
+            None,
+            "footprint",
+            Some("fp-kiid-1".to_string()),
+            Some("U1".to_string()),
+        )
+        .unwrap();
+        assert_eq!(ra.owner, "footprint");
+        assert_eq!(ra.footprint_kiid.as_deref(), Some("fp-kiid-1"));
+        assert_eq!(ra.footprint_reference.as_deref(), Some("U1"));
+    }
+
+    #[test]
+    fn zone_with_no_settings_is_excluded() {
+        let mut zone = rule_area_zone(true, false, false, false, false);
+        zone.settings = None;
+        assert!(KiCadIpcClient::zone_to_rule_area(&zone, None, "board", None, None).is_none());
     }
 }
 

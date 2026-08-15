@@ -279,6 +279,14 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_query_vias(args, ctx).await }
         ),
         tool!(
+            "query_rule_areas",
+            "List rule areas / keepouts on the board, optionally filtered by layer. Covers both board-level and footprint-embedded rule areas. Distinct from copper-pour zones: returns each rule area's KIID, name, layers, outline bounds, owner (board or footprint, with footprint KIID/reference), and which item types (copper, vias, tracks, pads, footprints) it restricts.",
+            json!({"type":"object","properties":{
+                "board":{"type":"string"},"layer":{"type":"string","description":"Filter by layer (optional)"}
+            },"required":["board"]}),
+            |args, ctx| async move { handle_query_rule_areas(args, ctx).await }
+        ),
+        tool!(
             "get_nets_list",
             "Return all nets defined on the PCB via KiCAD IPC.",
             json!({
@@ -1702,6 +1710,21 @@ async fn handle_query_vias(
     });
     Ok(CallToolResult::json(
         &json!({"count":vias.len(),"vias":vias}),
+    ))
+}
+
+async fn handle_query_rule_areas(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let layer = args["layer"].as_str().map(String::from);
+    let board = get_path(args, "board")?;
+    let rule_areas = ipc!(ctx, |c| {
+        c.ensure_board_is_active(&board)?;
+        c.get_rule_areas(layer.as_deref())
+    });
+    Ok(CallToolResult::json(
+        &json!({"count":rule_areas.len(),"rule_areas":rule_areas}),
     ))
 }
 

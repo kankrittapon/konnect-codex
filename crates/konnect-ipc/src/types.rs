@@ -175,6 +175,28 @@ pub struct IpcViaGeometry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcRuleArea {
+    /// KiCad-native stable object identity (KIID).
+    pub kiid: String,
+    /// User-assigned zone/rule-area name, if any.
+    pub name: String,
+    pub layers: Vec<String>,
+    pub bounds: Vec<Vec<IpcVector2>>,
+    pub keepout_copper: bool,
+    pub keepout_vias: bool,
+    pub keepout_tracks: bool,
+    pub keepout_pads: bool,
+    pub keepout_footprints: bool,
+    /// "board" for a top-level KotPcbZone rule area, "footprint" if it is
+    /// embedded in a footprint's definition (`FootprintInstance.definition.items`).
+    pub owner: String,
+    /// KIID of the owning footprint instance, if `owner == "footprint"`.
+    pub footprint_kiid: Option<String>,
+    /// Reference designator of the owning footprint (e.g. "U1"), if known.
+    pub footprint_reference: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcPolygonGeometry {
     pub object_type: String,
     pub reference: Option<String>,
