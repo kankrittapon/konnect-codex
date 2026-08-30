@@ -300,3 +300,71 @@ fn rotate_footprint_rotates_children_around_anchor() {
     .unwrap();
     assert_eq!(pad.pad_stack.unwrap().angle.unwrap().value_degrees, 90.0);
 }
+
+#[test]
+fn flip_footprint_mirrors_children_preserves_identity_and_swaps_layers() {
+    let mut footprint = mk_footprint_r1();
+    footprint.layer = kiapi::board::types::BoardLayer::BlFCu as i32;
+    let definition = footprint.definition.as_mut().unwrap();
+    let mut pad = kiapi::board::types::Pad::decode(definition.items[0].value.as_slice()).unwrap();
+    pad.id = Some(kiapi::common::types::Kiid {
+        value: "pad-1".to_string(),
+    });
+    pad.number = "1".to_string();
+    pad.net = Some(builders::net("USB_DP_CONN", 7));
+    pad.pad_stack.as_mut().unwrap().layers = vec![kiapi::board::types::BoardLayer::BlFCu as i32];
+    definition.items[0] = builders::pack_any(&pad, "kiapi.board.types.Pad");
+    definition.items.push(builders::pack_any(
+        &builders::board_segment("F.CrtYd", 0.05, 99.0, 99.0, 101.0, 99.0),
+        "kiapi.board.types.BoardGraphicShape",
+    ));
+
+    let (mock, captured) = spawn_footprint_mock(footprint);
+    let client = KiCadIpcClient::new(&mock.url);
+    client.flip_footprint("R1").unwrap();
+
+    let update = captured.lock().unwrap().take().expect("UpdateItems sent");
+    let sent =
+        kiapi::board::types::FootprintInstance::decode(update.items[0].value.as_slice()).unwrap();
+    assert_eq!(sent.layer, kiapi::board::types::BoardLayer::BlBCu as i32);
+    assert_eq!(sent.orientation.unwrap().value_degrees, 0.0);
+    assert_eq!(pad_positions_mm(&sent)[0], (101.0, 100.0));
+
+    let flipped = kiapi::board::types::Pad::decode(
+        sent.definition.as_ref().unwrap().items[0].value.as_slice(),
+    )
+    .unwrap();
+    assert_eq!(flipped.id.unwrap().value, "pad-1");
+    assert_eq!(flipped.number, "1");
+    assert_eq!(flipped.net.unwrap().name, "USB_DP_CONN");
+    assert_eq!(
+        flipped.pad_stack.unwrap().layers,
+        vec![kiapi::board::types::BoardLayer::BlBCu as i32]
+    );
+    let courtyard = sent
+        .definition
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .find(|item| {
+            item.type_url.ends_with("BoardGraphicShape")
+                && kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+                    .map(|shape| shape.layer == kiapi::board::types::BoardLayer::BlBCrtYd as i32)
+                    .unwrap_or(false)
+        })
+        .unwrap();
+    let courtyard =
+        kiapi::board::types::BoardGraphicShape::decode(courtyard.value.as_slice()).unwrap();
+    assert_eq!(
+        courtyard.layer,
+        kiapi::board::types::BoardLayer::BlBCrtYd as i32
+    );
+    match courtyard.shape.unwrap().geometry.unwrap() {
+        kiapi::common::types::graphic_shape::Geometry::Segment(segment) => {
+            assert_eq!(builders::nm_to_mm(segment.start.unwrap().x_nm), 101.0);
+            assert_eq!(builders::nm_to_mm(segment.end.unwrap().x_nm), 99.0);
+        }
+        other => panic!("expected courtyard segment, got {other:?}"),
+    }
+}

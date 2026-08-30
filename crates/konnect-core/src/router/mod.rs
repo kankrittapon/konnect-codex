@@ -135,6 +135,7 @@ mod tests {
             "project",
             "pcb_board",
             "pcb_components",
+            "sch_analysis",
             "pcb_routing",
             "pcb_export",
             "verification",

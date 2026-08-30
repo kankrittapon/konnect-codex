@@ -16,6 +16,7 @@ pub static STARTER_KIT: &[&str] = &[
     "pcb_board",
     "pcb_components",
     "pcb_routing",
+    "sch_analysis",
     "pcb_export",
     "verification",
 ];
@@ -72,7 +73,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "pcb_components",
         description: "Place, move, rotate, align, and duplicate PCB footprints",
         category: "pcb",
-        tool_count: 13,
+        tool_count: 14,
     },
     ToolsetMeta {
         name: "pcb_routing",

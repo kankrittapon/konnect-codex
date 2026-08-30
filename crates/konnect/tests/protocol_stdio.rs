@@ -166,6 +166,7 @@ fn handshake_baseline_and_full_registry_loads() {
         "config",
         "pcb_board",
         "pcb_components",
+        "sch_analysis",
         "pcb_routing",
         "pcb_export",
         "verification",

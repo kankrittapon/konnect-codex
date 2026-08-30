@@ -1680,6 +1680,55 @@ impl KiCadIpcClient {
         anyhow::bail!("Footprint '{}' not found", reference)
     }
 
+    /// Flip a footprint from front to back (or back to front) around its
+    /// anchor, preserving pad IDs, numbers, nets, and the footprint UUID.
+    pub fn flip_footprint(&self, reference: &str) -> Result<()> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in &items {
+            if let Ok(mut fp) =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            {
+                let ref_text = fp
+                    .reference_field
+                    .as_ref()
+                    .and_then(|f| f.text.as_ref())
+                    .and_then(|bt| bt.text.as_ref())
+                    .map(|t| t.text.as_str())
+                    .unwrap_or("");
+                if ref_text != reference {
+                    continue;
+                }
+
+                crate::transform::flip_footprint_children(&mut fp)?;
+                fp.layer = match kiapi::board::types::BoardLayer::try_from(fp.layer)
+                    .unwrap_or(kiapi::board::types::BoardLayer::BlUnknown)
+                {
+                    kiapi::board::types::BoardLayer::BlFCu => {
+                        kiapi::board::types::BoardLayer::BlBCu as i32
+                    }
+                    kiapi::board::types::BoardLayer::BlBCu => {
+                        kiapi::board::types::BoardLayer::BlFCu as i32
+                    }
+                    other => anyhow::bail!(
+                        "Footprint '{}' is on unsupported layer {:?}; only F.Cu/B.Cu can flip",
+                        reference,
+                        other
+                    ),
+                };
+                if let Some(orientation) = fp.orientation.as_mut() {
+                    orientation.value_degrees =
+                        crate::transform::normalize_footprint_angle(-orientation.value_degrees);
+                } else {
+                    fp.orientation = Some(kiapi::common::types::Angle { value_degrees: 0.0 });
+                }
+                let any = crate::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
+                self.update_items(vec![any])?;
+                return Ok(());
+            }
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
     /// Update the visible value field of an existing footprint.
     pub fn set_footprint_value(&self, reference: &str, value: &str) -> Result<()> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;

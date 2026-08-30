@@ -28,6 +28,8 @@ pub enum Xform {
         cy_nm: i64,
         delta_deg: f64,
     },
+    /// Mirror children across the vertical axis through the footprint anchor.
+    FlipX { cx_nm: i64, cy_nm: i64 },
 }
 
 impl Xform {
@@ -48,6 +50,7 @@ impl Xform {
                     cy_nm + (ry * c - rx * s).round() as i64,
                 )
             }
+            Xform::FlipX { cx_nm, .. } => (2 * cx_nm - x, y),
         }
     }
 
@@ -55,7 +58,12 @@ impl Xform {
         match *self {
             Xform::Translate { .. } => 0.0,
             Xform::Rotate { delta_deg, .. } => delta_deg,
+            Xform::FlipX { .. } => 0.0,
         }
+    }
+
+    fn is_flip(&self) -> bool {
+        matches!(self, Xform::FlipX { .. })
     }
 
     /// True when the rotation keeps axis-aligned shapes axis-aligned.
@@ -66,7 +74,7 @@ impl Xform {
 }
 
 /// Normalize to (-180, 180], the range KiCAD's `EDA_ANGLE::Normalize180` uses.
-fn normalize_deg(deg: f64) -> f64 {
+pub fn normalize_footprint_angle(deg: f64) -> f64 {
     let mut d = deg % 360.0;
     if d <= -180.0 {
         d += 360.0;
@@ -85,11 +93,17 @@ fn xform_vec2(v: &mut Option<common::Vector2>, xf: &Xform) {
 }
 
 fn xform_angle(a: &mut Option<common::Angle>, xf: &Xform) {
+    if xf.is_flip() {
+        if let Some(angle) = a.as_mut() {
+            angle.value_degrees = normalize_footprint_angle(-angle.value_degrees);
+        }
+        return;
+    }
     let delta = xf.angle_delta_deg();
     if delta != 0.0 {
         let base = a.as_ref().map(|x| x.value_degrees).unwrap_or(0.0);
         *a = Some(common::Angle {
-            value_degrees: normalize_deg(base + delta),
+            value_degrees: normalize_footprint_angle(base + delta),
         });
     }
 }
@@ -105,6 +119,9 @@ fn xform_text(t: &mut Option<common::Text>, xf: &Xform) {
 
 fn xform_board_text(bt: &mut board::BoardText, xf: &Xform) {
     xform_text(&mut bt.text, xf);
+    if xf.is_flip() {
+        flip_layer(&mut bt.layer);
+    }
 }
 
 fn xform_field(f: &mut Option<board::Field>, xf: &Xform) {
@@ -113,6 +130,25 @@ fn xform_field(f: &mut Option<board::Field>, xf: &Xform) {
             xform_board_text(text, xf);
         }
     }
+}
+
+fn flip_layer(layer: &mut i32) {
+    use board::BoardLayer::*;
+    *layer = match board::BoardLayer::try_from(*layer).unwrap_or(BlUnknown) {
+        BlFCu => BlBCu,
+        BlBCu => BlFCu,
+        BlFMask => BlBMask,
+        BlBMask => BlFMask,
+        BlFPaste => BlBPaste,
+        BlBPaste => BlFPaste,
+        BlFSilkS => BlBSilkS,
+        BlBSilkS => BlFSilkS,
+        BlFCrtYd => BlBCrtYd,
+        BlBCrtYd => BlFCrtYd,
+        BlFFab => BlBFab,
+        BlBFab => BlFFab,
+        other => other,
+    } as i32;
 }
 
 fn xform_polyline(pl: &mut common::PolyLine, xf: &Xform) {
@@ -150,6 +186,9 @@ fn xform_graphic_shape(gs: &mut board::BoardGraphicShape, xf: &Xform) -> Result<
     let Some(shape) = gs.shape.as_mut() else {
         return Ok(());
     };
+    if xf.is_flip() {
+        flip_layer(&mut gs.layer);
+    }
     match shape.geometry.as_mut() {
         Some(Geometry::Segment(seg)) => {
             xform_vec2(&mut seg.start, xf);
@@ -285,6 +324,17 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
             xform_vec2(&mut pad.position, xf);
             if let Some(ps) = pad.pad_stack.as_mut() {
                 xform_angle(&mut ps.angle, xf);
+                if xf.is_flip() {
+                    for layer in ps.layers.iter_mut() {
+                        flip_layer(layer);
+                    }
+                    for copper in ps.copper_layers.iter_mut() {
+                        flip_layer(&mut copper.layer);
+                        for shape in copper.custom_shapes.iter_mut() {
+                            xform_graphic_shape(shape, xf)?;
+                        }
+                    }
+                }
             }
             item.value = pad.encode_to_vec();
         } else if url.ends_with("kiapi.board.types.BoardText") {
@@ -339,6 +389,20 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
         }
     }
     Ok(())
+}
+
+/// Apply a true front/back mirror to all footprint children. IDs, pad numbers,
+/// nets, and electrical attributes are retained; geometry, orientation, and
+/// paired front/back layers are transformed.
+pub fn flip_footprint_children(fp: &mut board::FootprintInstance) -> Result<()> {
+    let anchor = fp.position.unwrap_or_default();
+    transform_footprint_children(
+        fp,
+        &Xform::FlipX {
+            cx_nm: anchor.x_nm,
+            cy_nm: anchor.y_nm,
+        },
+    )
 }
 
 #[cfg(test)]

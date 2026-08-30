@@ -97,9 +97,8 @@ fn resolve_footprint_source(lib_id: &str, board: &Path) -> anyhow::Result<String
 ///
 /// Placing on the back is not a layer rename: KiCAD's flip mirrors the
 /// footprint's geometry (pad X positions negate, every front layer swaps with
-/// its back counterpart per item). Until Konnect implements that mirror,
-/// pretending to support `B.Cu` silently produces wrong copper, so the layer
-/// is refused up front — before anything is resolved, sent, or written.
+/// its back counterpart per item). Direct B-side placement remains refused;
+/// callers should use the validated `flip_component` IPC pipeline.
 fn back_side_layer_error(layer: &str) -> Option<CallToolResult> {
     if !layer.starts_with("B.") {
         return None;
@@ -107,13 +106,13 @@ fn back_side_layer_error(layer: &str) -> Option<CallToolResult> {
     Some(CallToolResult::error_kind(
         crate::mcp::error::ToolErrorKind::InvalidArgument {
             field: "layer".to_string(),
-            reason: format!("back-side placement on '{layer}' is not yet supported"),
+            reason: format!(
+                "direct back-side placement on '{layer}' is not supported; use flip_component"
+            ),
         },
         format!(
-            "Cannot place on '{layer}': back-side placement is not yet supported, \
-             because a correct flip must mirror the footprint geometry rather than \
-             just rename its layers. Place the footprint on F.Cu and flip it to the \
-             back in KiCAD (select it and press F)."
+            "Cannot place on '{layer}': direct back-side placement is not supported; \
+             place on F.Cu and use flip_component, which mirrors geometry and swaps paired layers."
         ),
     ))
 }
@@ -161,11 +160,11 @@ fn prepare_footprint_source(
     // No back-side placement: a correct F.Cu→B.Cu flip mirrors the geometry
     // (pad X positions negate, layers swap per item) the way KiCAD's own flip
     // does. A textual layer swap produces wrong copper, so it is refused
-    // outright — see back_side_layer_error.
+    // outright — see back_side_layer_error. The dedicated flip_component
+    // pipeline performs the required child-geometry mirror first.
     if layer != "F.Cu" {
         anyhow::bail!(
-            "footprints can only be placed on F.Cu (back-side placement is not yet \
-             supported because a correct flip must mirror the geometry), got '{layer}'"
+            "footprints can only be placed on F.Cu (use flip_component for B.Cu), got '{layer}'"
         );
     }
     let mut prepared = source.to_string();
@@ -745,7 +744,7 @@ fn replace_property_value(content: &str, key: &str, value: &str) -> String {
 /// direct child of the footprint, not one belonging to a pad or graphic.
 ///
 /// Note this only retargets the footprint; a true F.Cu↔B.Cu flip would also
-/// have to mirror every child item, which is why back-side placement is
+/// have to mirror every child item, which is why direct back-side placement is
 /// rejected before this code can run (see `back_side_layer_error`).
 fn replace_footprint_layer(content: &str, layer: &str) -> String {
     let Some(name) = footprint_name_span(content) else {
@@ -907,6 +906,19 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference", "rotation"]
             }),
             |args, ctx| async move { handle_rotate_component(args, ctx).await }
+        ),
+        tool!(
+            "flip_component",
+            "Flip a placed footprint between F.Cu and B.Cu via KiCAD IPC.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":     { "type": "string" },
+                    "reference": { "type": "string", "description": "Reference designator" }
+                },
+                "required": ["board", "reference"]
+            }),
+            |args, ctx| async move { handle_flip_component(args, ctx).await }
         ),
         tool!(
             "delete_component",
@@ -1221,6 +1233,21 @@ async fn handle_rotate_component(
     Ok(CallToolResult::json(
         &json!({ "rotated": reference, "rotation": rotation }),
     ))
+}
+
+async fn handle_flip_component(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let reference = match require_str(args, "reference") {
+        Ok(v) if !v.trim().is_empty() => v.to_string(),
+        Ok(_) => return Ok(CallToolResult::error("reference must not be empty")),
+        Err(e) => return Ok(e),
+    };
+
+    let ref_ipc = reference.clone();
+    ipc!(ctx, args, |c| c.flip_footprint(&ref_ipc));
+    Ok(CallToolResult::json(&json!({ "flipped": reference })))
 }
 
 async fn handle_delete_component(
@@ -1760,7 +1787,7 @@ mod tests {
             "B.Cu",
         )
         .unwrap_err();
-        assert!(error.to_string().contains("not yet supported"), "{error}");
+        assert!(error.to_string().contains("use flip_component"), "{error}");
     }
 
     #[test]
@@ -2403,7 +2430,7 @@ mod tests {
         );
         let text = result_text(&res);
         assert!(
-            text.contains("back-side placement is not yet supported"),
+            text.contains("direct back-side placement is not supported"),
             "must say why: {text}"
         );
         assert!(
