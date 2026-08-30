@@ -961,6 +961,23 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_find_component(args, ctx).await }
         ),
         tool!(
+            "evaluate_placement",
+            "Read-only hypothetical placement clearance evaluation against live courtyard geometry.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "ref": { "type": "string" },
+                    "target_x": { "type": "number" },
+                    "target_y": { "type": "number" },
+                    "target_rotation_deg": { "type": "number" },
+                    "clearance_mm": { "type": "number", "default": 0.20 }
+                },
+                "required": ["board", "ref", "target_x", "target_y", "target_rotation_deg"]
+            }),
+            |args, ctx| async move { handle_evaluate_placement(args, ctx).await }
+        ),
+        tool!(
             "get_component_pads",
             "Return the pad positions and net assignments for a footprint.",
             json!({
@@ -1424,6 +1441,141 @@ async fn handle_get_component_list(
     ))
 }
 
+fn placement_transform(p: (f64, f64), x: f64, y: f64, degrees: f64) -> (f64, f64) {
+    let (s, c) = degrees.to_radians().sin_cos();
+    (x + p.0 * c - p.1 * s, y + p.0 * s + p.1 * c)
+}
+
+fn placement_bbox(points: &[(f64, f64)]) -> Option<(f64, f64, f64, f64)> {
+    let first = *points.first()?;
+    let mut b = (first.0, first.1, first.0, first.1);
+    for &(x, y) in &points[1..] {
+        b.0 = b.0.min(x);
+        b.1 = b.1.min(y);
+        b.2 = b.2.max(x);
+        b.3 = b.3.max(y);
+    }
+    Some(b)
+}
+
+fn bbox_clearance(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> f64 {
+    let dx = (a.0 - b.2).max(b.0 - a.2).max(0.0);
+    let dy = (a.1 - b.3).max(b.1 - a.3).max(0.0);
+    if dx > 0.0 || dy > 0.0 {
+        (dx * dx + dy * dy).sqrt()
+    } else {
+        -((a.2.min(b.2) - a.0.max(b.0)).min(a.3.min(b.3) - a.1.max(b.1)))
+    }
+}
+
+async fn handle_evaluate_placement(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let reference = match require_str(args, "ref") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let target_x = match require_f64(args, "target_x") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let target_y = match require_f64(args, "target_y") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let target_rotation = match require_f64(args, "target_rotation_deg") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let clearance = args["clearance_mm"].as_f64().unwrap_or(0.20);
+    if clearance < 0.0 {
+        return Ok(CallToolResult::error("clearance_mm must be non-negative"));
+    }
+    let (footprints, geometry) = ipc!(ctx, args, |c| {
+        Ok((c.list_footprints()?, c.get_routing_geometry()?))
+    });
+    let target_fp = match footprints.iter().find(|fp| fp.reference == reference) {
+        Some(fp) => fp,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "component '{reference}' not found"
+            )))
+        }
+    };
+    let source_courtyards: Vec<_> = geometry
+        .courtyards
+        .items
+        .iter()
+        .filter(|c| c.reference.as_deref() == Some(&reference))
+        .collect();
+    if source_courtyards.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "component '{reference}' has no supported F.CrtYd/B.CrtYd geometry"
+        )));
+    }
+    // Convert the live courtyard back to the footprint-local frame, then
+    // apply the requested rigid transform. This preserves KiCad's exact
+    // current courtyard (including board-embedded overrides) while allowing
+    // hypothetical translation and rotation without mutating IPC.
+    let local_points: Vec<(f64, f64)> = source_courtyards
+        .iter()
+        .flat_map(|c| c.polygons.iter().flatten())
+        .map(|p| {
+            let r = (-target_fp.rotation).to_radians();
+            let (s, c) = r.sin_cos();
+            let dx = p.x - target_fp.position.x;
+            let dy = p.y - target_fp.position.y;
+            (dx * c - dy * s, dx * s + dy * c)
+        })
+        .collect();
+    let target_points: Vec<_> = local_points
+        .iter()
+        .map(|&p| placement_transform(p, target_x, target_y, target_rotation))
+        .collect();
+    let target_bbox = placement_bbox(&target_points).expect("source courtyard was non-empty");
+    let mut neighbor_points: HashMap<String, (String, Vec<(f64, f64)>)> = HashMap::new();
+    for c in &geometry.courtyards.items {
+        let Some(other) = c.reference.as_deref() else {
+            continue;
+        };
+        if other == reference {
+            continue;
+        }
+        let entry = neighbor_points
+            .entry(other.to_string())
+            .or_insert_with(|| (c.layer.clone(), Vec::new()));
+        entry
+            .1
+            .extend(c.polygons.iter().flatten().map(|p| (p.x, p.y)));
+    }
+    let mut violations = Vec::new();
+    let mut nearest: Option<(String, f64)> = None;
+    for (other, (layer, points)) in neighbor_points {
+        let Some(bbox) = placement_bbox(&points) else {
+            continue;
+        };
+        let distance = bbox_clearance(target_bbox, bbox);
+        if nearest.as_ref().map(|(_, d)| distance < *d).unwrap_or(true) {
+            nearest = Some((other.clone(), distance));
+        }
+        if distance < clearance {
+            violations.push(json!({"reference": other, "layer": layer, "clearance_mm": distance}));
+        }
+    }
+    Ok(CallToolResult::json(&json!({
+        "ref": reference,
+        "target": {"x": target_x, "y": target_y, "rotation_deg": target_rotation},
+        "collision_free": violations.is_empty(),
+        "clearance_mm": clearance,
+        "violations": violations,
+        "nearest_neighbor": nearest.map(|(reference, distance_mm)| json!({"ref": reference, "distance_mm": distance_mm})),
+        "target_courtyard_bounds": {"x_min":target_bbox.0,"y_min":target_bbox.1,"x_max":target_bbox.2,"y_max":target_bbox.3},
+        "read_only": true,
+        "geometry_basis": "live KiCad IPC courtyard polygons; bbox clearance is conservative for non-rectangular courtyards"
+    })))
+}
+
 async fn handle_place_array(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1744,6 +1896,25 @@ mod tests {
   (property "Value" "R_0402" (at 0 1 0) (layer "F.Fab"))
   (pad "1" smd roundrect (at -0.5 0) (size 0.5 0.5)
     (layers "F.Cu" "F.Paste" "F.Mask")))"#;
+
+    #[test]
+    fn evaluate_placement_transform_matches_kicad_quarter_turn() {
+        let p = placement_transform((1.0, 0.0), 10.0, 20.0, 90.0);
+        assert!((p.0 - 10.0).abs() < 1e-9);
+        assert!((p.1 - 21.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn evaluate_placement_bbox_clearance_reports_overlap_and_gap() {
+        assert_eq!(
+            bbox_clearance((0.0, 0.0, 1.0, 1.0), (2.0, 0.0, 3.0, 1.0)),
+            1.0
+        );
+        assert_eq!(
+            bbox_clearance((0.0, 0.0, 2.0, 2.0), (1.0, 1.0, 3.0, 3.0)),
+            -1.0
+        );
+    }
 
     #[test]
     fn prepares_complete_front_footprint() {
